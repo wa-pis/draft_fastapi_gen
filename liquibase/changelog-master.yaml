@@ -1,0 +1,4 @@
+databaseChangeLog:
+  - include:
+      file: migration/001-init-user-and-outbox.yaml
+
