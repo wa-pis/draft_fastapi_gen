@@ -68,11 +68,6 @@ async def fetch_pending_batch(session: AsyncSession, limit: int = 100) -> list[d
                     AND attempt_count < :max_attempts
                     AND next_attempt_at <= :now
                 )
-                OR (
-                    status = 'publishing'
-                    AND attempt_count < :max_attempts
-                    AND next_attempt_at <= :now
-                )
             ORDER BY id
             LIMIT :limit
             FOR UPDATE SKIP LOCKED

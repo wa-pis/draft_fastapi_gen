@@ -31,7 +31,6 @@ databaseChangeLog:
         - createIndex:
             tableName: users
             indexName: idx_users_email
-            unique: true
             columns:
               - column:
                   name: email
@@ -95,18 +94,6 @@ databaseChangeLog:
                   type: text
                   constraints:
                     nullable: true
-              - column:
-                  name: attempt_count
-                  type: integer
-                  defaultValueNumeric: 0
-                  constraints:
-                    nullable: false
-              - column:
-                  name: next_attempt_at
-                  type: timestamp with time zone
-                  defaultValueComputed: CURRENT_TIMESTAMP
-                  constraints:
-                    nullable: false
 
         - createIndex:
             tableName: outbox_events
@@ -114,7 +101,5 @@ databaseChangeLog:
             columns:
               - column:
                   name: status
-              - column:
-                  name: next_attempt_at
               - column:
                   name: id

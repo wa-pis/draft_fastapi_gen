@@ -626,11 +626,6 @@ def scaffold_infra(service_name: str) -> None:
                             AND attempt_count < :max_attempts
                             AND next_attempt_at <= :now
                         )
-                        OR (
-                            status = 'publishing'
-                            AND attempt_count < :max_attempts
-                            AND next_attempt_at <= :now
-                        )
                     ORDER BY id
                     LIMIT :limit
                     FOR UPDATE SKIP LOCKED
@@ -766,8 +761,13 @@ def scaffold_api_example(service_name: str) -> None:
         service_root / "application" / "idempotency.py",
         """
         import json
+        import secrets
         from dataclasses import dataclass
         from typing import Any, Protocol
+
+
+        class IdempotencyKeyConflictError(ValueError):
+            pass
 
 
         class RedisClient(Protocol):
@@ -776,6 +776,8 @@ def scaffold_api_example(service_name: str) -> None:
             async def set(self, key: str, value: str, *, ex: int, nx: bool = False) -> bool: ...
 
             async def delete(self, key: str) -> None: ...
+
+            async def eval(self, script: str, numkeys: int, *keys_and_args: str) -> Any: ...
 
 
         @dataclass(kw_only=True, frozen=True, slots=True)
@@ -794,43 +796,70 @@ def scaffold_api_example(service_name: str) -> None:
 
                 return redis
 
-            async def get_existing(self, key: str | None) -> dict[str, Any] | None:
+            async def get_existing(self, key: str | None, request_hash: str) -> dict[str, Any] | None:
                 if not key:
                     return None
                 raw = await self.redis.get(self.prefix + key)
-                return json.loads(raw) if raw else None
+                if not raw:
+                    return None
+                stored = json.loads(raw)
+                if stored.get("request_hash") != request_hash:
+                    raise IdempotencyKeyConflictError("idempotency key was used with a different request")
+                response = stored.get("response")
+                return response if isinstance(response, dict) else None
 
-            async def acquire(self, key: str | None) -> bool:
+            async def acquire(self, key: str | None) -> str | None:
                 if not key:
-                    return True
-                return bool(
+                    return None
+                token = secrets.token_urlsafe(32)
+                acquired = bool(
                     await self.redis.set(
                         self.lock_prefix + key,
-                        "1",
+                        token,
                         ex=self.lock_ttl_seconds,
                         nx=True,
                     )
                 )
+                return token if acquired else None
 
-            async def release(self, key: str | None) -> None:
-                if key:
-                    await self.redis.delete(self.lock_prefix + key)
+            async def release(self, key: str | None, token: str | None) -> None:
+                if not key or not token:
+                    return
+                await self.redis.eval(
+                    '''
+                    if redis.call("get", KEYS[1]) == ARGV[1] then
+                        return redis.call("del", KEYS[1])
+                    end
+                    return 0
+                    ''',
+                    1,
+                    self.lock_prefix + key,
+                    token,
+                )
 
-            async def store(self, key: str | None, response: dict[str, Any]) -> None:
+            async def store(self, key: str | None, request_hash: str, response: dict[str, Any]) -> None:
                 if not key:
                     return
-                await self.redis.set(self.prefix + key, json.dumps(response), ex=self.ttl_seconds)
+                await self.redis.set(
+                    self.prefix + key,
+                    json.dumps({{"request_hash": request_hash, "response": response}}),
+                    ex=self.ttl_seconds,
+                )
         """,
     )
 
     write_file(
         service_root / "api" / "routes.py",
         f"""
+        import hashlib
+        import json
+        import logging
+
         from fastapi import APIRouter, Depends, Header, HTTPException, status
         from sqlalchemy import text
         from sqlalchemy.ext.asyncio import AsyncSession
 
-        from app.application.idempotency import IdempotencyService
+        from app.application.idempotency import IdempotencyKeyConflictError, IdempotencyService
         from app.config.settings import get_settings
         from app.infra.db import get_db_session, db_is_healthy
         from app.infra.kafka import kafka_is_healthy
@@ -839,6 +868,12 @@ def scaffold_api_example(service_name: str) -> None:
 
         router = APIRouter()
         settings = get_settings()
+        logger = logging.getLogger(__name__)
+
+
+        def request_fingerprint() -> str:
+            canonical_payload = json.dumps({{"route": "ping"}}, sort_keys=True, separators=(",", ":"))
+            return hashlib.sha256(f"GET:/v1/ping:{{canonical_payload}}".encode("utf-8")).hexdigest()
 
 
         async def get_session() -> AsyncSession:
@@ -871,19 +906,40 @@ def scaffold_api_example(service_name: str) -> None:
                 ttl_seconds=settings.IDEMPOTENCY_TTL_SECONDS,
                 lock_ttl_seconds=settings.IDEMPOTENCY_LOCK_TTL_SECONDS,
             )
-            existing = await idem.get_existing(idempotency_key)
+            request_hash = request_fingerprint()
+            try:
+                existing = await idem.get_existing(idempotency_key, request_hash)
+            except IdempotencyKeyConflictError as exc:
+                raise HTTPException(
+                    status_code=409,
+                    detail="idempotency key was used with a different request",
+                ) from exc
             if existing:
                 return existing
 
-            if not await idem.acquire(idempotency_key):
+            lock_token = await idem.acquire(idempotency_key)
+            if idempotency_key and not lock_token:
                 raise HTTPException(status_code=409, detail="request with this idempotency key is still processing")
 
-            await session.execute(text("SELECT 1"))
-
-            response = {{"message": "pong", "service": "{service_name}"}}
-            await idem.store(idempotency_key, response)
-            await idem.release(idempotency_key)
-            return response
+            try:
+                await session.execute(text("SELECT 1"))
+                response = {{"message": "pong", "service": "{service_name}"}}
+                try:
+                    await idem.store(idempotency_key, request_hash, response)
+                except Exception:
+                    logger.exception(
+                        "failed to store idempotency response",
+                        extra={{"idempotency_key": idempotency_key}},
+                    )
+                return response
+            finally:
+                try:
+                    await idem.release(idempotency_key, lock_token)
+                except Exception:
+                    logger.exception(
+                        "failed to release idempotency lock",
+                        extra={{"idempotency_key": idempotency_key}},
+                    )
         """,
     )
 

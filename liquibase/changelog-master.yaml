@@ -1,4 +1,5 @@
 databaseChangeLog:
   - include:
       file: migration/001-init-user-and-outbox.yaml
-
+  - include:
+      file: migration/002-add-user-constraints-and-outbox-retry.yaml

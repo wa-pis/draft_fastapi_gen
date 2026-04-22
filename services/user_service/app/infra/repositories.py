@@ -11,6 +11,15 @@ class DuplicateUserEmailError(ValueError):
     pass
 
 
+def is_duplicate_email_error(exc: IntegrityError) -> bool:
+    message = str(getattr(exc, "orig", exc)).lower()
+    return (
+        "duplicate key" in message
+        and "unique constraint" in message
+        and ("idx_users_email" in message or "users_email" in message or "email" in message)
+    )
+
+
 @dataclass(kw_only=True, frozen=True, slots=True)
 class UserRepository:
     session: AsyncSession
@@ -32,4 +41,6 @@ class UserRepository:
                 },
             )
         except IntegrityError as exc:
+            if not is_duplicate_email_error(exc):
+                raise
             raise DuplicateUserEmailError(user.email) from exc
