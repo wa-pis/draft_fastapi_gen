@@ -72,7 +72,8 @@ def scaffold_base(service_name: str) -> None:
         service_root / "config" / "settings.py",
         f"""
         from functools import lru_cache
-        from pydantic import BaseSettings, AnyUrl
+        from pydantic import AnyUrl, Field
+        from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
         class Settings(BaseSettings):
@@ -84,16 +85,34 @@ def scaffold_base(service_name: str) -> None:
             PORT: int = 8000
 
             DATABASE_URL: AnyUrl
+            DB_POOL_SIZE: int = Field(default=5, ge=1)
+            DB_MAX_OVERFLOW: int = Field(default=10, ge=0)
+            DB_POOL_TIMEOUT_SECONDS: float = Field(default=30.0, gt=0)
+            DB_POOL_RECYCLE_SECONDS: int = Field(default=1800, ge=0)
+
             KAFKA_BOOTSTRAP_SERVERS: str
             KAFKA_CLIENT_ID: str = "{service_name}"
+            KAFKA_HEALTH_TTL_SECONDS: float = Field(default=10.0, gt=0)
+            KAFKA_HEALTH_TIMEOUT_SECONDS: float = Field(default=3.0, gt=0)
+
             REDIS_URL: AnyUrl
+            IDEMPOTENCY_TTL_SECONDS: int = Field(default=3600, gt=0)
+            IDEMPOTENCY_LOCK_TTL_SECONDS: int = Field(default=30, gt=0)
 
             OTLP_ENDPOINT: str | None = None
             LOG_LEVEL: str = "INFO"
 
-            class Config:
-                env_file = ".env"
-                env_file_encoding = "utf-8"
+            OUTBOX_BATCH_SIZE: int = Field(default=100, ge=1)
+            OUTBOX_IDLE_SLEEP_SECONDS: float = Field(default=0.5, ge=0)
+            OUTBOX_PUBLISH_CONCURRENCY: int = Field(default=10, ge=1)
+            OUTBOX_RETRY_DELAY_SECONDS: int = Field(default=30, ge=1)
+            OUTBOX_MAX_ATTEMPTS: int = Field(default=5, ge=1)
+
+            model_config = SettingsConfigDict(
+                env_file=".env",
+                env_file_encoding="utf-8",
+                populate_by_name=True,
+            )
 
 
         @lru_cache
@@ -230,6 +249,21 @@ def scaffold_observability(service_name: str) -> None:
             "Number of messages processed by workers",
             ["worker"],
         )
+        WORKER_MESSAGE_LATENCY = Histogram(
+            "worker_message_latency_seconds",
+            "Worker message processing latency",
+            ["worker", "status"],
+        )
+        OUTBOX_EVENTS = Counter(
+            "outbox_events_total",
+            "Number of outbox events processed by status",
+            ["status"],
+        )
+        OUTBOX_BACKLOG = Gauge(
+            "outbox_backlog",
+            "Number of outbox events currently waiting by status",
+            ["status"],
+        )
         DB_QUERY_LATENCY = Histogram(
             "db_query_latency_seconds",
             "Database query latency",
@@ -255,6 +289,17 @@ def scaffold_observability(service_name: str) -> None:
             REQUEST_LATENCY.labels(method=method, path=path, status=status).observe(duration)
             if status >= 400:
                 ERROR_COUNT.labels(method=method, path=path, status=status).inc()
+
+
+        def observe_worker_message(worker: str, status: str, duration: float) -> None:
+            WORKER_MESSAGE_LATENCY.labels(worker=worker, status=status).observe(duration)
+            if status == "published":
+                WORKER_THROUGHPUT.labels(worker=worker).inc()
+            OUTBOX_EVENTS.labels(status=status).inc()
+
+
+        def set_outbox_backlog(status: str, count: int) -> None:
+            OUTBOX_BACKLOG.labels(status=status).set(count)
         """,
     )
 
@@ -393,12 +438,20 @@ def scaffold_infra(service_name: str) -> None:
             async_sessionmaker,
             create_async_engine,
         )
+        from sqlalchemy import text
 
         from app.config.settings import get_settings
 
 
         settings = get_settings()
-        engine = create_async_engine(str(settings.DATABASE_URL), pool_pre_ping=True)
+        engine = create_async_engine(
+            str(settings.DATABASE_URL),
+            pool_pre_ping=True,
+            pool_size=settings.DB_POOL_SIZE,
+            max_overflow=settings.DB_MAX_OVERFLOW,
+            pool_timeout=settings.DB_POOL_TIMEOUT_SECONDS,
+            pool_recycle=settings.DB_POOL_RECYCLE_SECONDS,
+        )
         SessionLocal = async_sessionmaker(engine, expire_on_commit=False, class_=AsyncSession)
 
 
@@ -414,7 +467,7 @@ def scaffold_infra(service_name: str) -> None:
         async def db_is_healthy() -> bool:
             async with SessionLocal() as session:
                 try:
-                    await session.execute("SELECT 1")  # type: ignore[arg-type]
+                    await session.execute(text("SELECT 1"))
                     return True
                 except Exception:
                     return False
@@ -426,6 +479,8 @@ def scaffold_infra(service_name: str) -> None:
         """
         from __future__ import annotations
 
+        import asyncio
+        import time
         from typing import Any
 
         from aiokafka import AIOKafkaProducer, AIOKafkaConsumer
@@ -436,6 +491,7 @@ def scaffold_infra(service_name: str) -> None:
 
 
         settings = get_settings()
+        _health_cache: tuple[float, bool] = (0.0, False)
 
 
         class KafkaProducer:
@@ -474,11 +530,20 @@ def scaffold_infra(service_name: str) -> None:
 
 
         async def kafka_is_healthy() -> bool:
+            global _health_cache
+
+            checked_at, is_healthy = _health_cache
+            now = time.monotonic()
+            if now - checked_at < settings.KAFKA_HEALTH_TTL_SECONDS:
+                return is_healthy
+
             producer = KafkaProducer()
             try:
-                await producer.start()
+                await asyncio.wait_for(producer.start(), timeout=settings.KAFKA_HEALTH_TIMEOUT_SECONDS)
+                _health_cache = (now, True)
                 return True
             except Exception:
+                _health_cache = (now, False)
                 return False
             finally:
                 try:
@@ -512,12 +577,16 @@ def scaffold_infra(service_name: str) -> None:
     write_file(
         service_root / "infra" / "outbox.py",
         f"""
-        from datetime import datetime
+        from datetime import UTC, datetime, timedelta
 
-        from sqlalchemy import text
+        from sqlalchemy import JSON, bindparam, text
         from sqlalchemy.ext.asyncio import AsyncSession
 
+        from app.config.settings import get_settings
         from app.domain.events import DomainEvent
+
+
+        settings = get_settings()
 
 
         async def add_outbox_event(session: AsyncSession, event: DomainEvent) -> None:
@@ -529,6 +598,9 @@ def scaffold_infra(service_name: str) -> None:
                     VALUES
                         (:aggregate_type, :aggregate_id, :event_type, :payload, :headers, :occurred_at, 'pending')
                     '''
+                ).bindparams(
+                    bindparam("payload", type_=JSON),
+                    bindparam("headers", type_=JSON),
                 ),
                 {{
                     "aggregate_type": event.aggregate_type,
@@ -547,20 +619,44 @@ def scaffold_infra(service_name: str) -> None:
                     '''
                     SELECT id, aggregate_type, aggregate_id, event_type, payload, headers
                     FROM outbox_events
-                    WHERE status = 'pending'
+                    WHERE
+                        status = 'pending'
+                        OR (
+                            status = 'failed'
+                            AND attempt_count < :max_attempts
+                            AND next_attempt_at <= :now
+                        )
+                        OR (
+                            status = 'publishing'
+                            AND attempt_count < :max_attempts
+                            AND next_attempt_at <= :now
+                        )
                     ORDER BY id
                     LIMIT :limit
                     FOR UPDATE SKIP LOCKED
                     '''
                 ),
-                {{"limit": limit}},
+                {{"limit": limit, "max_attempts": settings.OUTBOX_MAX_ATTEMPTS, "now": datetime.now(UTC)}},
             )
             rows = result.mappings().all()
             ids = [row["id"] for row in rows]
             if ids:
                 await session.execute(
-                    text("UPDATE outbox_events SET status = 'publishing' WHERE id = ANY(:ids)"),
-                    {{"ids": ids}},
+                    text(
+                        '''
+                        UPDATE outbox_events
+                        SET
+                            status = 'publishing',
+                            attempt_count = attempt_count + 1,
+                            next_attempt_at = :next_attempt_at
+                        WHERE id = ANY(:ids)
+                        '''
+                    ),
+                    {{
+                        "ids": ids,
+                        "next_attempt_at": datetime.now(UTC)
+                        + timedelta(seconds=settings.OUTBOX_RETRY_DELAY_SECONDS),
+                    }},
                 )
             return [dict(row) for row in rows]
 
@@ -574,21 +670,46 @@ def scaffold_infra(service_name: str) -> None:
                     WHERE id = :id
                     '''
                 ),
-                {{"id": event_id, "now": datetime.utcnow()}},
+                {{"id": event_id, "now": datetime.now(UTC)}},
             )
 
 
         async def mark_failed(session: AsyncSession, event_id: int, error: str) -> None:
+            next_attempt_at = datetime.now(UTC) + timedelta(seconds=settings.OUTBOX_RETRY_DELAY_SECONDS)
             await session.execute(
                 text(
                     '''
                     UPDATE outbox_events
-                    SET status = 'failed', error = :error
+                    SET
+                        status = CASE
+                            WHEN attempt_count >= :max_attempts THEN 'dead_letter'
+                            ELSE 'failed'
+                        END,
+                        error = :error,
+                        next_attempt_at = :next_attempt_at
                     WHERE id = :id
                     '''
                 ),
-                {{"id": event_id, "error": error}},
+                {{
+                    "id": event_id,
+                    "error": error,
+                    "next_attempt_at": next_attempt_at,
+                    "max_attempts": settings.OUTBOX_MAX_ATTEMPTS,
+                }},
             )
+
+
+        async def count_by_status(session: AsyncSession) -> dict[str, int]:
+            result = await session.execute(
+                text(
+                    '''
+                    SELECT status, count(*) AS count
+                    FROM outbox_events
+                    GROUP BY status
+                    '''
+                )
+            )
+            return {{row["status"]: row["count"] for row in result.mappings().all()}}
         """,
     )
 
@@ -596,13 +717,13 @@ def scaffold_infra(service_name: str) -> None:
     write_file(
         service_root / "domain" / "events.py",
         """
-        from dataclasses import dataclass, asdict
-        from datetime import datetime
+        from dataclasses import asdict, dataclass
+        from datetime import UTC, datetime
         from typing import Any
         from uuid import uuid4
 
 
-        @dataclass
+        @dataclass(frozen=True, slots=True)
         class DomainEvent:
             id: str
             event_type: str
@@ -626,7 +747,7 @@ def scaffold_infra(service_name: str) -> None:
                 event_type=event_type,
                 aggregate_type=aggregate_type,
                 aggregate_id=aggregate_id,
-                occurred_at=datetime.utcnow(),
+                occurred_at=datetime.now(UTC),
                 payload=payload,
             )
         """,
@@ -645,44 +766,79 @@ def scaffold_api_example(service_name: str) -> None:
         service_root / "application" / "idempotency.py",
         """
         import json
+        from dataclasses import dataclass
+        from typing import Any, Protocol
 
-        from app.infra.redis_client import redis
+
+        class RedisClient(Protocol):
+            async def get(self, key: str) -> str | None: ...
+
+            async def set(self, key: str, value: str, *, ex: int, nx: bool = False) -> bool: ...
+
+            async def delete(self, key: str) -> None: ...
 
 
+        @dataclass(kw_only=True, frozen=True, slots=True)
         class IdempotencyService:
-            def __init__(self, prefix: str = "idem:api:", ttl_seconds: int = 3600) -> None:
-                self._prefix = prefix
-                self._ttl = ttl_seconds
+            prefix: str = "idem:api:"
+            lock_prefix: str = "idem:lock:"
+            ttl_seconds: int = 3600
+            lock_ttl_seconds: int = 30
+            redis_client: RedisClient | None = None
 
-            async def get_existing(self, key: str | None) -> dict | None:
+            @property
+            def redis(self) -> RedisClient:
+                if self.redis_client is not None:
+                    return self.redis_client
+                from app.infra.redis_client import redis
+
+                return redis
+
+            async def get_existing(self, key: str | None) -> dict[str, Any] | None:
                 if not key:
                     return None
-                raw = await redis.get(self._prefix + key)
+                raw = await self.redis.get(self.prefix + key)
                 return json.loads(raw) if raw else None
 
-            async def store(self, key: str | None, response: dict) -> None:
+            async def acquire(self, key: str | None) -> bool:
+                if not key:
+                    return True
+                return bool(
+                    await self.redis.set(
+                        self.lock_prefix + key,
+                        "1",
+                        ex=self.lock_ttl_seconds,
+                        nx=True,
+                    )
+                )
+
+            async def release(self, key: str | None) -> None:
+                if key:
+                    await self.redis.delete(self.lock_prefix + key)
+
+            async def store(self, key: str | None, response: dict[str, Any]) -> None:
                 if not key:
                     return
-                await redis.set(self._prefix + key, json.dumps(response), ex=self._ttl)
+                await self.redis.set(self.prefix + key, json.dumps(response), ex=self.ttl_seconds)
         """,
     )
 
     write_file(
         service_root / "api" / "routes.py",
         f"""
-        import time
-
         from fastapi import APIRouter, Depends, Header, HTTPException, status
+        from sqlalchemy import text
         from sqlalchemy.ext.asyncio import AsyncSession
 
         from app.application.idempotency import IdempotencyService
+        from app.config.settings import get_settings
         from app.infra.db import get_db_session, db_is_healthy
         from app.infra.kafka import kafka_is_healthy
         from app.infra.redis_client import redis_is_healthy
-        from app.observability.metrics import observe_request
 
 
         router = APIRouter()
+        settings = get_settings()
 
 
         async def get_session() -> AsyncSession:
@@ -711,18 +867,22 @@ def scaffold_api_example(service_name: str) -> None:
             idempotency_key: str | None = Header(None, alias="Idempotency-Key"),
             session: AsyncSession = Depends(get_session),
         ) -> dict[str, str]:
-            idem = IdempotencyService()
+            idem = IdempotencyService(
+                ttl_seconds=settings.IDEMPOTENCY_TTL_SECONDS,
+                lock_ttl_seconds=settings.IDEMPOTENCY_LOCK_TTL_SECONDS,
+            )
             existing = await idem.get_existing(idempotency_key)
             if existing:
                 return existing
 
-            started = time.perf_counter()
-            await session.execute("SELECT 1")  # type: ignore[arg-type]
-            duration = time.perf_counter() - started
-            observe_request("GET", "/v1/ping", 200, duration)
+            if not await idem.acquire(idempotency_key):
+                raise HTTPException(status_code=409, detail="request with this idempotency key is still processing")
+
+            await session.execute(text("SELECT 1"))
 
             response = {{"message": "pong", "service": "{service_name}"}}
             await idem.store(idempotency_key, response)
+            await idem.release(idempotency_key)
             return response
         """,
     )
@@ -760,49 +920,108 @@ def scaffold_outbox_worker(service_name: str) -> None:
         """
         import asyncio
         import json
+        import time
+        from collections.abc import AsyncIterator
+        from contextlib import asynccontextmanager
+        from typing import TYPE_CHECKING, Any
 
-        from sqlalchemy.ext.asyncio import AsyncSession
+        from app.config.settings import get_settings
+        from app.infra.outbox import count_by_status, fetch_pending_batch, mark_failed, mark_published
 
-        from app.infra.db import get_db_session
-        from app.infra.kafka import KafkaProducer
-        from app.infra.outbox import fetch_pending_batch, mark_published, mark_failed
-        from app.observability.metrics import WORKER_THROUGHPUT
+        if TYPE_CHECKING:
+            from app.infra.kafka import KafkaProducer
 
 
-        BATCH_SIZE = 100
         TOPIC_HEADER = "topic"
+        settings = get_settings()
 
 
-        async def publish_once(session: AsyncSession, producer: KafkaProducer) -> None:
-            events = await fetch_pending_batch(session, BATCH_SIZE)
-            for row in events:
+        @asynccontextmanager
+        async def get_db_session() -> AsyncIterator[Any]:
+            from app.infra.db import get_db_session as open_db_session
+
+            async with open_db_session() as session:
+                yield session
+
+
+        def observe_worker_message(worker: str, status: str, duration: float) -> None:
+            from app.observability.metrics import observe_worker_message as observe
+
+            observe(worker, status, duration)
+
+
+        def set_outbox_backlog(status: str, count: int) -> None:
+            from app.observability.metrics import set_outbox_backlog as set_backlog
+
+            set_backlog(status, count)
+
+
+        def _build_kafka_headers(headers: dict[str, Any]) -> list[tuple[str, bytes]]:
+            return [
+                (key, str(value).encode("utf-8"))
+                for key, value in headers.items()
+                if key != TOPIC_HEADER and value is not None
+            ]
+
+
+        async def _publish_event(
+            row: dict[str, Any],
+            producer: "KafkaProducer",
+            semaphore: asyncio.Semaphore,
+        ) -> tuple[int, str | None]:
+            started = time.perf_counter()
+            async with semaphore:
                 headers = row["headers"] or {}
                 topic = headers.get(TOPIC_HEADER)
                 if not topic:
-                    await mark_failed(session, row["id"], "missing topic header")
-                    continue
+                    observe_worker_message("outbox_publisher", "failed", time.perf_counter() - started)
+                    return row["id"], "missing topic header"
                 try:
-                    payload_bytes = json.dumps(row["payload"]).encode("utf-8")
-                    await producer.send(
-                        topic,
-                        payload_bytes,
-                        headers=[("event_id", str(row["id"]).encode())],
-                    )
-                    await mark_published(session, row["id"])
-                    WORKER_THROUGHPUT.labels(worker="outbox_publisher").inc()
+                    payload_bytes = json.dumps(row["payload"], separators=(",", ":")).encode("utf-8")
+                    await producer.send(topic, payload_bytes, headers=_build_kafka_headers(headers))
+                    observe_worker_message("outbox_publisher", "published", time.perf_counter() - started)
+                    return row["id"], None
                 except Exception as exc:  # noqa: BLE001
-                    await mark_failed(session, row["id"], str(exc))
-            await session.commit()
+                    observe_worker_message("outbox_publisher", "failed", time.perf_counter() - started)
+                    return row["id"], str(exc)
+
+
+        async def publish_once(producer: "KafkaProducer") -> int:
+            async with get_db_session() as session:
+                events = await fetch_pending_batch(session, settings.OUTBOX_BATCH_SIZE)
+                for status, count in (await count_by_status(session)).items():
+                    set_outbox_backlog(status, count)
+                await session.commit()
+
+            if not events:
+                return 0
+
+            semaphore = asyncio.Semaphore(settings.OUTBOX_PUBLISH_CONCURRENCY)
+            results = await asyncio.gather(
+                *(_publish_event(row, producer, semaphore) for row in events),
+            )
+
+            async with get_db_session() as session:
+                for event_id, error in results:
+                    if error is None:
+                        await mark_published(session, event_id)
+                    else:
+                        await mark_failed(session, event_id, error)
+                await session.commit()
+
+            return len(events)
 
 
         async def run() -> None:
+            from app.infra.kafka import KafkaProducer
+
             producer = KafkaProducer()
             await producer.start()
             try:
                 while True:
-                    async with get_db_session() as session:
-                        await publish_once(session, producer)
-                    await asyncio.sleep(0.5)
+                    processed = await publish_once(producer)
+                    if not processed:
+                        await asyncio.sleep(settings.OUTBOX_IDLE_SLEEP_SECONDS)
             finally:
                 await producer.stop()
 
@@ -835,4 +1054,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-

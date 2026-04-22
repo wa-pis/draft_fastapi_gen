@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import asyncio
+import time
 from typing import Any
 
 from aiokafka import AIOKafkaProducer, AIOKafkaConsumer
@@ -10,6 +12,7 @@ from app.resilience.retry import retry_with_backoff
 
 
 settings = get_settings()
+_health_cache: tuple[float, bool] = (0.0, False)
 
 
 class KafkaProducer:
@@ -46,16 +49,23 @@ def build_consumer(
 
 
 async def kafka_is_healthy() -> bool:
-    # lightweight health check by attempting to start/stop a producer
+    global _health_cache
+
+    checked_at, is_healthy = _health_cache
+    now = time.monotonic()
+    if now - checked_at < settings.KAFKA_HEALTH_TTL_SECONDS:
+        return is_healthy
+
     producer = KafkaProducer()
     try:
-        await producer.start()
+        await asyncio.wait_for(producer.start(), timeout=settings.KAFKA_HEALTH_TIMEOUT_SECONDS)
+        _health_cache = (now, True)
         return True
     except Exception:
+        _health_cache = (now, False)
         return False
     finally:
         try:
             await producer.stop()
         except Exception:
             pass
-

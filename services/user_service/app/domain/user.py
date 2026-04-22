@@ -1,9 +1,9 @@
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import UTC, datetime
 from uuid import uuid4
 
 
-@dataclass
+@dataclass(frozen=True, slots=True)
 class User:
     id: str
     email: str
@@ -12,5 +12,4 @@ class User:
 
     @classmethod
     def register(cls, email: str, name: str) -> "User":
-        return cls(id=str(uuid4()), email=email, name=name, created_at=datetime.utcnow())
-
+        return cls(id=str(uuid4()), email=email, name=name, created_at=datetime.now(UTC))

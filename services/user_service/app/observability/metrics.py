@@ -18,6 +18,21 @@ WORKER_THROUGHPUT = Counter(
     "Number of messages processed by workers",
     ["worker"],
 )
+WORKER_MESSAGE_LATENCY = Histogram(
+    "worker_message_latency_seconds",
+    "Worker message processing latency",
+    ["worker", "status"],
+)
+OUTBOX_EVENTS = Counter(
+    "outbox_events_total",
+    "Number of outbox events processed by status",
+    ["status"],
+)
+OUTBOX_BACKLOG = Gauge(
+    "outbox_backlog",
+    "Number of outbox events currently waiting by status",
+    ["status"],
+)
 DB_QUERY_LATENCY = Histogram(
     "db_query_latency_seconds",
     "Database query latency",
@@ -44,3 +59,13 @@ def observe_request(method: str, path: str, status: int, duration: float) -> Non
     if status >= 400:
         ERROR_COUNT.labels(method=method, path=path, status=status).inc()
 
+
+def observe_worker_message(worker: str, status: str, duration: float) -> None:
+    WORKER_MESSAGE_LATENCY.labels(worker=worker, status=status).observe(duration)
+    if status == "published":
+        WORKER_THROUGHPUT.labels(worker=worker).inc()
+    OUTBOX_EVENTS.labels(status=status).inc()
+
+
+def set_outbox_backlog(status: str, count: int) -> None:
+    OUTBOX_BACKLOG.labels(status=status).set(count)

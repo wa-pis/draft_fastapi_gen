@@ -1,10 +1,10 @@
-from dataclasses import dataclass, asdict
-from datetime import datetime
+from dataclasses import asdict, dataclass
+from datetime import UTC, datetime
 from typing import Any
 from uuid import uuid4
 
 
-@dataclass
+@dataclass(frozen=True, slots=True)
 class DomainEvent:
     id: str
     event_type: str
@@ -23,7 +23,7 @@ def new_event(event_type: str, aggregate_type: str, aggregate_id: str, payload: 
         event_type=event_type,
         aggregate_type=aggregate_type,
         aggregate_id=aggregate_id,
-        occurred_at=datetime.utcnow(),
+        occurred_at=datetime.now(UTC),
         payload=payload,
     )
 
@@ -35,4 +35,3 @@ def user_created(user_id: str, email: str, name: str) -> DomainEvent:
         aggregate_id=user_id,
         payload={"user_id": user_id, "email": email, "name": name},
     )
-
