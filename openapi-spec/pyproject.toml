@@ -1,0 +1,23 @@
+[build-system]
+requires = ["setuptools>=65", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "petstore-client"
+version = "0.0.1"
+description = "Generated Python client for the Swagger Petstore OpenAPI example."
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "pydantic>=2.11",
+    "python-dateutil>=2.8.2",
+    "typing-extensions>=4.7.1",
+    "urllib3>=2.1.0,<3.0.0",
+]
+
+[tool.setuptools.packages.find]
+where = ["generated-python-client"]
+include = ["petstore_client*"]
+
+[tool.setuptools.package-data]
+petstore_client = ["py.typed"]
