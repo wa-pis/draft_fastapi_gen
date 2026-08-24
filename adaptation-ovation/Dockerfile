@@ -2,7 +2,7 @@
 
 FROM ghcr.io/astral-sh/uv:0.11.23 AS uv
 
-FROM python:3.13-slim AS builder
+FROM python:3.13 AS builder
 
 ENV UV_COMPILE_BYTECODE=1 \
     UV_LINK_MODE=copy
@@ -10,16 +10,15 @@ ENV UV_COMPILE_BYTECODE=1 \
 WORKDIR /app
 
 COPY --from=uv /uv /usr/local/bin/uv
-COPY pyproject.toml uv.lock ./
-RUN uv sync --locked --no-dev --no-install-project
+COPY pyproject.toml uv.lock Makefile ./
+RUN uv sync --locked --no-dev --group build --no-install-project
 
 COPY src ./src
-RUN uv sync --locked --no-dev --no-editable
+RUN make build
 
 FROM python:3.13-slim AS runtime
 
 ENV HOME=/tmp \
-    PATH="/app/.venv/bin:${PATH}" \
     PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     TMPDIR=/tmp \
@@ -30,9 +29,9 @@ RUN groupadd --gid 10001 worker \
 
 WORKDIR /app
 
-COPY --from=builder --chown=worker:worker /app/.venv /app/.venv
+COPY --from=builder --chown=worker:worker /app/dist/calculation-worker /app/calculation-worker
 
 USER worker
 VOLUME ["/tmp"]
 
-CMD ["calculation-worker"]
+CMD ["/app/calculation-worker"]

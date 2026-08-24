@@ -290,6 +290,16 @@ uv run ruff format --check .
 uv run mypy src
 ```
 
+Build a standalone executable for the current operating system and architecture:
+
+```bash
+make build
+./dist/calculation-worker
+```
+
+PyInstaller writes its temporary build files under `build/`; neither build output directory is
+committed. Build the executable on the same operating system and architecture where it will run.
+
 ## Consumer groups and scaling
 
 Every replica uses the same `KAFKA_GROUP_ID` and a unique `KAFKA_CLIENT_ID`. Each calls
@@ -378,13 +388,16 @@ Build the locked multi-stage image and run it with a read-only root filesystem:
 docker build -t adaptation-ovation .
 docker run --rm \
   --read-only \
-  --tmpfs /tmp:rw,noexec,nosuid,size=64m \
+  --tmpfs /tmp:rw,exec,nosuid,size=128m \
   --env-file .env \
   -p 8000:8000 \
   adaptation-ovation
 ```
 
-The runtime is based on `python:3.13-slim`, contains no build tools, runs as an unprivileged user,
-starts with the exec-form `calculation-worker` command, and writes temporary/cache data only under
-`/tmp`. When containerized, Kafka and upstream addresses must be reachable from the container;
-`localhost` refers to the container itself.
+The builder runs the same `make build` target used locally. The runtime is based on
+`python:3.13-slim`, receives only the PyInstaller executable from the builder (no source tree,
+virtual environment, or build tools), runs as an unprivileged user, and starts it with exec-form
+`CMD`. PyInstaller one-file
+executables unpack native libraries under `/tmp` at startup, so that explicitly mounted directory
+must be writable, executable, and at least 128 MB. When containerized, Kafka and upstream addresses
+must be reachable from the container; `localhost` refers to the container itself.
