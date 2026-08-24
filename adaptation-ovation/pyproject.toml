@@ -1,0 +1,56 @@
+[build-system]
+requires = ["hatchling>=1.27"]
+build-backend = "hatchling.build"
+
+[project]
+name = "adaptation-ovation"
+version = "0.1.0"
+description = "Synchronous Kafka worker for calculation events"
+requires-python = ">=3.13,<3.14"
+dependencies = [
+    "confluent-kafka>=2.6,<3",
+    "httpx>=0.27,<1",
+    "prometheus-client>=0.21,<1",
+    "pydantic>=2.9,<3",
+    "pydantic-settings>=2.5,<3",
+    "tenacity>=9,<10",
+]
+
+[project.scripts]
+calculation-worker = "calculation_worker.main:main"
+
+[dependency-groups]
+dev = [
+    "mypy>=1.13",
+    "pytest>=8.3",
+    "respx>=0.22",
+    "ruff>=0.8",
+    "testcontainers[kafka]>=4.8",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/calculation_worker"]
+
+[tool.pytest.ini_options]
+addopts = ["--strict-markers", "-m", "not integration"]
+testpaths = ["tests"]
+markers = [
+    "integration: tests that require Docker and a real Kafka broker",
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py313"
+
+[tool.ruff.lint]
+select = ["E4", "E7", "E9", "F", "I", "UP", "B", "SIM", "RUF"]
+
+[tool.ruff.lint.isort]
+known-first-party = ["calculation_worker"]
+
+[tool.mypy]
+python_version = "3.13"
+strict = true
+files = ["src"]
+show_error_codes = true
+pretty = true
