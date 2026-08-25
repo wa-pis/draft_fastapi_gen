@@ -11,6 +11,7 @@ from calculation_worker.domain.models import (
     CalculationFailed,
     CalculationRequested,
     CalculationResult,
+    CalculationStarted,
     DeadLetterError,
     DeadLetterHeader,
     DeadLetterRecord,
@@ -76,6 +77,17 @@ class EventFactory:
         self.dlq_topic = dlq_topic
         self._service_name = service_name
         self._clock = clock or (lambda: datetime.now(UTC))
+
+    def started(self, request: CalculationRequested) -> OutgoingRecord:
+        value = CalculationStarted(
+            event_id=_event_id(request.request_id, request.calc_process, "calculation.started"),
+            source=self._service_name,
+            request_id=request.request_id,
+            calc_id=request.calc_id,
+            calc_process=request.calc_process,
+            occurred_at=self._clock(),
+        )
+        return OutgoingRecord(topic=self.output_topic, key=request.request_id, value=value)
 
     def completed(self, request: CalculationRequested, result: CalculationResult) -> OutgoingRecord:
         value = CalculationCompleted(

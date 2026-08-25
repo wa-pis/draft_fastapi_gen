@@ -1,6 +1,6 @@
 import json
 from base64 import b64encode
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from datetime import UTC, datetime
 from typing import Any
 
@@ -19,6 +19,7 @@ from calculation_worker.domain.models import (
     DeadLetterRecord,
     HandlerResult,
     MessageContext,
+    OutgoingRecord,
 )
 from calculation_worker.infrastructure.observability import Metrics
 
@@ -38,6 +39,11 @@ class RecordingHandler:
     ) -> HandlerResult:
         self.calls.append((payload, context))
         return HandlerResult(records=(), outcome="completed")
+
+
+class RejectingPublisher:
+    def publish_and_wait(self, _records: Sequence[OutgoingRecord]) -> None:
+        raise AssertionError("invalid or unsupported requests must not publish started")
 
 
 def _context() -> MessageContext:
@@ -88,7 +94,7 @@ def test_calculation_requested_is_routed_to_registered_handler() -> None:
 
 @pytest.mark.parametrize(
     "event_type",
-    ["calculation.completed", "calculation.failed", "future.event"],
+    ["calculation.started", "calculation.completed", "calculation.failed", "future.event"],
 )
 def test_event_without_registered_handler_is_ignored(event_type: str) -> None:
     payload = json.dumps({"event_type": event_type, "schema_version": 1}).encode()
@@ -181,6 +187,7 @@ def _calculation_processor() -> MessageProcessor:
             calculation_registry=CalculationRegistry(),
             event_factory=factory,
             metrics=metrics,
+            publisher=RejectingPublisher(),
         )
     )
     return MessageProcessor(registry, factory, metrics)

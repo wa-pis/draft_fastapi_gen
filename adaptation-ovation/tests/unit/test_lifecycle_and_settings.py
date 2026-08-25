@@ -154,6 +154,11 @@ def test_invalid_retry_budget_is_rejected_before_startup() -> None:
         )
 
 
+def test_runtime_budget_counts_started_and_terminal_publications() -> None:
+    with pytest.raises(ConfigurationError, match="configuration is invalid"):
+        _settings(KAFKA_MAX_POLL_INTERVAL_MS=2_000)
+
+
 def test_upstream_base_url_rejects_embedded_credentials() -> None:
     password = "embedded-secret-password"
     with pytest.raises(ConfigurationError, match="configuration is invalid") as captured:

@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import time
 from collections.abc import Mapping
+from dataclasses import dataclass
 from threading import Event, Thread
 from typing import Any
 from uuid import uuid4, uuid5
@@ -33,6 +34,15 @@ pytestmark = pytest.mark.integration
 class _StaticUpstream:
     def get_data(self, _calc_id: str) -> Mapping[str, Any]:
         return {"one": 1, "two": 2}
+
+
+@dataclass(frozen=True, slots=True)
+class _ObservedEvent:
+    event_type: str
+    key: bytes | None
+    event_id: str
+    partition: int
+    offset: int
 
 
 @pytest.fixture
@@ -100,7 +110,7 @@ def test_multiple_messages_and_committed_restart(kafka: KafkaContainer) -> None:
         }
     )
     observer.subscribe([topic])
-    completed = _collect_completed(observer, len(request_ids), timeout_seconds=30)
+    lifecycle_events = _collect_lifecycle_events(observer, len(request_ids), timeout_seconds=30)
     stop.set()
     worker.join(timeout=15)
 
@@ -112,15 +122,7 @@ def test_multiple_messages_and_committed_restart(kafka: KafkaContainer) -> None:
         group_id,
         source_offsets,
     )
-    assert set(completed) == set(request_ids)
-    for request_id, (key, event_id) in completed.items():
-        assert key == request_id.encode()
-        assert event_id == str(
-            uuid5(
-                EVENT_ID_NAMESPACE,
-                f"{request_id}:example:calculation.completed",
-            )
-        )
+    _assert_lifecycle_events(lifecycle_events, request_ids)
 
     restart_settings = _settings(
         bootstrap_servers,
@@ -154,14 +156,14 @@ def test_multiple_messages_and_committed_restart(kafka: KafkaContainer) -> None:
             ).encode(),
         )
     assert input_producer.flush(10) == 0
-    after_restart = _collect_completed(observer, len(sentinel_ids), timeout_seconds=30)
+    after_restart = _collect_lifecycle_events(observer, len(sentinel_ids), timeout_seconds=30)
     restart_stop.set()
     restarted.join(timeout=15)
     observer.close()
 
     assert not restarted.is_alive()
     assert restart_errors == []
-    assert set(after_restart) == set(sentinel_ids)
+    _assert_lifecycle_events(after_restart, sentinel_ids)
 
 
 def _settings(
@@ -204,11 +206,13 @@ def _run_worker(settings: Settings, stop: Event, errors: list[BaseException]) ->
         factory = EventFactory(
             settings.kafka_topic, settings.kafka_dlq_topic, settings.service_name
         )
-        messages = MessageHandlerRegistry()
-        messages.register(CalculationRequestedMessageHandler(calculations, factory, metrics))
-        processor = MessageProcessor(messages, factory, metrics)
         consumer = KafkaConsumerAdapter(settings)
         publisher = KafkaPublisher(settings, metrics)
+        messages = MessageHandlerRegistry()
+        messages.register(
+            CalculationRequestedMessageHandler(calculations, factory, metrics, publisher)
+        )
+        processor = MessageProcessor(messages, factory, metrics)
         loop = ConsumerLoop(consumer, processor, publisher, stop, settings, metrics)
         loop.run()
     except BaseException as error:
@@ -259,18 +263,52 @@ def _assert_group_committed_past_inputs(
     )
 
 
-def _collect_completed(
+def _collect_lifecycle_events(
     consumer: Consumer,
-    expected: int,
+    expected_completed: int,
     timeout_seconds: float,
-) -> dict[str, tuple[bytes | None, str]]:
-    completed: dict[str, tuple[bytes | None, str]] = {}
+) -> dict[str, list[_ObservedEvent]]:
+    events: dict[str, list[_ObservedEvent]] = {}
+    completed_request_ids: set[str] = set()
     deadline = time.monotonic() + timeout_seconds
-    while len(completed) < expected and time.monotonic() < deadline:
+    while len(completed_request_ids) < expected_completed and time.monotonic() < deadline:
         message = consumer.poll(min(0.5, max(0.0, deadline - time.monotonic())))
         if message is None or message.error() is not None or message.value() is None:
             continue
         payload = json.loads(message.value())
-        if payload.get("event_type") == "calculation.completed":
-            completed[payload["request_id"]] = (message.key(), payload["event_id"])
-    return completed
+        event_type = payload.get("event_type")
+        if event_type not in {"calculation.started", "calculation.completed"}:
+            continue
+        request_id = payload["request_id"]
+        events.setdefault(request_id, []).append(
+            _ObservedEvent(
+                event_type=event_type,
+                key=message.key(),
+                event_id=payload["event_id"],
+                partition=message.partition(),
+                offset=message.offset(),
+            )
+        )
+        if event_type == "calculation.completed":
+            completed_request_ids.add(request_id)
+    return events
+
+
+def _assert_lifecycle_events(
+    events: dict[str, list[_ObservedEvent]], expected_request_ids: list[str]
+) -> None:
+    assert set(events) == set(expected_request_ids)
+    for request_id, observed in events.items():
+        assert [event.event_type for event in observed] == [
+            "calculation.started",
+            "calculation.completed",
+        ]
+        assert all(event.key == request_id.encode() for event in observed)
+        assert observed[0].partition == observed[1].partition
+        assert observed[0].offset < observed[1].offset
+        assert observed[0].event_id == str(
+            uuid5(EVENT_ID_NAMESPACE, f"{request_id}:example:calculation.started")
+        )
+        assert observed[1].event_id == str(
+            uuid5(EVENT_ID_NAMESPACE, f"{request_id}:example:calculation.completed")
+        )

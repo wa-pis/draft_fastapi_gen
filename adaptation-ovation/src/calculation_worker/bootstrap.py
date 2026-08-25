@@ -71,20 +71,22 @@ def build_runtime(settings: Settings, stop_signal: StopSignal) -> Runtime:
             dlq_topic=settings.kafka_dlq_topic,
             service_name=settings.service_name,
         )
+        consumer = KafkaConsumerAdapter(settings)
+        failed_build_cleanup.callback(_close_after_failed_build, "Kafka consumer", consumer.close)
+        publisher = KafkaPublisher(settings, metrics)
+        failed_build_cleanup.callback(_close_after_failed_build, "Kafka producer", publisher.close)
+
         message_registry = MessageHandlerRegistry()
         message_registry.register(
             CalculationRequestedMessageHandler(
                 calculation_registry=calculation_registry,
                 event_factory=event_factory,
                 metrics=metrics,
+                publisher=publisher,
             )
         )
 
         processor = MessageProcessor(message_registry, event_factory, metrics)
-        consumer = KafkaConsumerAdapter(settings)
-        failed_build_cleanup.callback(_close_after_failed_build, "Kafka consumer", consumer.close)
-        publisher = KafkaPublisher(settings, metrics)
-        failed_build_cleanup.callback(_close_after_failed_build, "Kafka producer", publisher.close)
         consumer_loop = ConsumerLoop(
             consumer=consumer,
             processor=processor,

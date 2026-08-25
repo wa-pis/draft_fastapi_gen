@@ -2,11 +2,11 @@
 
 from __future__ import annotations
 
-from collections.abc import Sequence
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Protocol
 
-from calculation_worker.domain.models import MessageContext, OutgoingRecord
+from calculation_worker.application.contracts import PublisherPort
+from calculation_worker.domain.models import MessageContext
 from calculation_worker.infrastructure.observability import Metrics
 from calculation_worker.settings import Settings
 
@@ -35,14 +35,6 @@ class ConsumerPort(Protocol):
     def poll(self, timeout: float) -> ConsumedRecord | None: ...
 
     def commit(self, record: ConsumedRecord) -> None: ...
-
-    def close(self) -> None: ...
-
-
-class PublisherPort(Protocol):
-    """Publish all records or raise before the input is committed."""
-
-    def publish_and_wait(self, records: Sequence[OutgoingRecord]) -> None: ...
 
     def close(self) -> None: ...
 

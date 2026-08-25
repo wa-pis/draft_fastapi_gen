@@ -56,12 +56,19 @@ class FakeConsumer:
 
 
 class FakeProcessor:
-    def __init__(self, results: Sequence[HandlerResult]) -> None:
+    def __init__(
+        self,
+        results: Sequence[HandlerResult],
+        error: Exception | None = None,
+    ) -> None:
         self._results = deque(results)
+        self._error = error
         self.calls: list[tuple[bytes, MessageContext]] = []
 
     def process(self, payload: bytes, context: MessageContext) -> HandlerResult:
         self.calls.append((payload, context))
+        if self._error is not None:
+            raise self._error
         return self._results.popleft()
 
 
@@ -127,6 +134,24 @@ def test_publish_failure_does_not_commit_or_poll_next_message() -> None:
     assert consumer.poll_count == 1
     assert consumer.commits == []
     assert len(publisher.batches) == 1
+
+
+def test_publish_failure_inside_handler_does_not_commit() -> None:
+    timeline: list[str] = []
+    loop, consumer, processor, publisher = _loop(
+        [_consumed(1), _consumed(2)],
+        [],
+        timeline,
+        processor_error=PublishError("started publication failed"),
+    )
+
+    with pytest.raises(PublishError, match="started publication failed"):
+        loop.run()
+
+    assert consumer.poll_count == 1
+    assert len(processor.calls) == 1
+    assert publisher.batches == []
+    assert consumer.commits == []
 
 
 def test_failed_and_dlq_are_published_together_before_commit() -> None:
@@ -270,6 +295,7 @@ def _loop(
     stop_during_first_poll: bool = False,
     fail_on_commit: bool = False,
     stop_during_publish: bool = False,
+    processor_error: Exception | None = None,
 ) -> tuple[ConsumerLoop, FakeConsumer, FakeProcessor, FakePublisher]:
     stop_signal = Event()
     consumer = FakeConsumer(
@@ -279,7 +305,7 @@ def _loop(
         stop_during_first_poll=stop_during_first_poll,
         fail_on_commit=fail_on_commit,
     )
-    processor = FakeProcessor(results)
+    processor = FakeProcessor(results, processor_error)
     publisher = FakePublisher(
         timeline,
         fail_on_call=fail_on_publish,
