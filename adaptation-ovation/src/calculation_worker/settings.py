@@ -187,12 +187,10 @@ class Settings(BaseSettings):
             self.upstream_max_attempts * per_attempt_seconds
             + (self.upstream_max_attempts - 1) * self.upstream_retry_max_wait_seconds
         )
-        if (
-            retry_budget_seconds + self.kafka_publish_timeout_seconds
-            >= self.kafka_max_poll_interval_ms / 1000
-        ):
+        publish_budget_seconds = 2 * self.kafka_publish_timeout_seconds
+        if retry_budget_seconds + publish_budget_seconds >= self.kafka_max_poll_interval_ms / 1000:
             raise ValueError(
-                "HTTP retry and Kafka publish budgets must fit KAFKA_MAX_POLL_INTERVAL_MS"
+                "HTTP retry and Kafka publication budgets must fit KAFKA_MAX_POLL_INTERVAL_MS"
             )
         return self
 

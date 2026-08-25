@@ -7,6 +7,7 @@ from typing import Any
 
 from pydantic import ValidationError
 
+from calculation_worker.application.contracts import PublisherPort
 from calculation_worker.application.event_factory import (
     CALCULATION_ERROR,
     INVALID_MESSAGE,
@@ -34,10 +35,12 @@ class CalculationRequestedMessageHandler:
         calculation_registry: CalculationRegistry,
         event_factory: EventFactory,
         metrics: Metrics,
+        publisher: PublisherPort,
     ) -> None:
         self._calculation_registry = calculation_registry
         self._event_factory = event_factory
         self._metrics = metrics
+        self._publisher = publisher
 
     def handle(
         self,
@@ -73,43 +76,39 @@ class CalculationRequestedMessageHandler:
             )
             return HandlerResult(records=tuple(records), outcome="failed")
 
-        started_at = monotonic()
-        metric_process = "unsupported"
+        lookup_started_at = monotonic()
         try:
             calculation = self._calculation_registry.get(request.calc_process)
-            metric_process = calculation.process_name
+        except Exception as error:
+            return self._failed(
+                request,
+                context,
+                metric_process="unsupported",
+                started_at=lookup_started_at,
+                error=error,
+            )
+
+        self._publisher.publish_and_wait((self._event_factory.started(request),))
+        logger.info(
+            "Calculation started",
+            extra={**_request_log_fields(request, context), "outcome": "started"},
+        )
+
+        started_at = monotonic()
+        try:
             result = calculation.calculate(request)
         except Exception as error:
-            duration = monotonic() - started_at
-            failure = failure_for_exception(error)
-            self._metrics.calculations.labels(metric_process, "failed").inc()
-            self._metrics.calculation_duration.labels(metric_process).observe(duration)
-            log_fields = {
-                **_request_log_fields(request, context),
-                "error_code": failure.code,
-                "outcome": "failed",
-                "processing_duration_ms": round(duration * 1000, 3),
-            }
-            if failure == CALCULATION_ERROR:
-                logger.exception("Unexpected calculation error", extra=log_fields)
-            else:
-                logger.warning("Calculation failed", extra=log_fields)
-            return HandlerResult(
-                records=(
-                    self._event_factory.failed(
-                        request.request_id,
-                        request.calc_id,
-                        request.calc_process,
-                        failure,
-                    ),
-                    self._event_factory.dead_letter(context, failure),
-                ),
-                outcome="failed",
+            return self._failed(
+                request,
+                context,
+                metric_process=calculation.process_name,
+                started_at=started_at,
+                error=error,
             )
 
         duration = monotonic() - started_at
-        self._metrics.calculations.labels(metric_process, "completed").inc()
-        self._metrics.calculation_duration.labels(metric_process).observe(duration)
+        self._metrics.calculations.labels(calculation.process_name, "completed").inc()
+        self._metrics.calculation_duration.labels(calculation.process_name).observe(duration)
         logger.info(
             "Calculation completed",
             extra={
@@ -121,6 +120,41 @@ class CalculationRequestedMessageHandler:
         return HandlerResult(
             records=(self._event_factory.completed(request, result),),
             outcome="completed",
+        )
+
+    def _failed(
+        self,
+        request: CalculationRequested,
+        context: MessageContext,
+        metric_process: str,
+        started_at: float,
+        error: Exception,
+    ) -> HandlerResult:
+        duration = monotonic() - started_at
+        failure = failure_for_exception(error)
+        self._metrics.calculations.labels(metric_process, "failed").inc()
+        self._metrics.calculation_duration.labels(metric_process).observe(duration)
+        log_fields = {
+            **_request_log_fields(request, context),
+            "error_code": failure.code,
+            "outcome": "failed",
+            "processing_duration_ms": round(duration * 1000, 3),
+        }
+        if failure == CALCULATION_ERROR:
+            logger.exception("Unexpected calculation error", extra=log_fields)
+        else:
+            logger.warning("Calculation failed", extra=log_fields)
+        return HandlerResult(
+            records=(
+                self._event_factory.failed(
+                    request.request_id,
+                    request.calc_id,
+                    request.calc_process,
+                    failure,
+                ),
+                self._event_factory.dead_letter(context, failure),
+            ),
+            outcome="failed",
         )
 
 

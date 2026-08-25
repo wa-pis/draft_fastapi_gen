@@ -19,8 +19,9 @@ poll
   -> validate the minimal event envelope
   -> route by MessageHandlerRegistry
   -> route calculation.requested by CalculationRegistry
+  -> publish calculation.started and wait for its delivery acknowledgement
   -> fetch upstream data and calculate
-  -> publish every outgoing record
+  -> publish calculation.completed or calculation.failed (+ DLQ)
   -> wait for every delivery acknowledgement
   -> synchronously commit the input offset
   -> next poll
@@ -40,7 +41,7 @@ src/calculation_worker/
     message_processor.py          envelope validation and event routing
     registries.py                 MessageHandlerRegistry
     calculation_requested_handler.py
-    event_factory.py              completed, failed, and DLQ records
+    event_factory.py              started, completed, failed, and DLQ records
   calculations/
     base.py                       CalculationHandler protocol
     registry.py                   CalculationRegistry
@@ -55,6 +56,9 @@ src/calculation_worker/
 `bootstrap.py` creates settings, Kafka consumer and producer adapters, one long-lived
 `httpx.Client`, both registries, handlers, processor, loop, metrics, and logging. Registration is
 explicit: there are no mutable global registries, dynamic imports, or plugin framework.
+`CalculationRequestedMessageHandler` receives the same publisher as the consumer loop so it can
+acknowledge the prerequisite `calculation.started` event before invoking calculation code; its
+returned `HandlerResult` contains only the terminal records still awaiting publication.
 
 ### The two registries
 
@@ -69,7 +73,7 @@ route never changes its publish/commit logic.
 To add a Kafka event type:
 
 1. Implement `MessageHandler` with a unique `event_type` and `handle(payload, context)`.
-2. Return a `HandlerResult` containing every required `OutgoingRecord`.
+2. Return a `HandlerResult` containing every outgoing record that remains to be published before the input offset is committed.
 3. Register the instance in `bootstrap.py`.
 
 To add a calculation:
@@ -101,6 +105,25 @@ Input topic: `INTEGRATIONS`.
   "calc_id": "service-456",
   "calc_process": "example",
   "occurred_at": "2026-08-25T12:00:00Z"
+}
+```
+
+### `calculation.started`
+
+Output topic: `INTEGRATIONS`; Kafka key: `request_id`. The broker acknowledges this event before
+the calculation implementation is called.
+
+```json
+{
+  "event_id": "deterministic-uuid-v5",
+  "event_type": "calculation.started",
+  "schema_version": 1,
+  "source": "calculation-worker",
+  "request_id": "request-123",
+  "calc_id": "service-456",
+  "calc_process": "example",
+  "status": "started",
+  "occurred_at": "2026-08-25T12:00:01Z"
 }
 ```
 
@@ -186,16 +209,19 @@ can publish an output and fail before committing the input offset, causing that 
 to be produced again. Consumer auto-commit and auto-offset-store are disabled; every successful
 input is committed synchronously by the loop.
 
-Completed and failed IDs use UUIDv5 with a fixed namespace and these names:
+Started, completed, and failed IDs use UUIDv5 with a fixed namespace and these names:
 
 ```text
+request_id + ":" + calc_process + ":calculation.started
 request_id + ":" + calc_process + ":calculation.completed
 request_id + ":" + calc_process + ":calculation.failed
 ```
 
-The same input therefore produces the same outcome ID, while completed and failed IDs differ.
-Downstream consumers must deduplicate by `event_id`. Kafka transactions are intentionally outside
-this version; a future consume-transform-produce implementation can use
+The same input therefore produces the same lifecycle IDs, while IDs for different lifecycle stages
+differ. Downstream consumers must deduplicate by `event_id`. A crash after `calculation.started` is
+acknowledged but before the input offset is committed can produce a duplicate started event and can
+leave a started event without a terminal event until redelivery. Kafka transactions are
+intentionally outside this version; a future consume-transform-produce implementation can use
 `send_offsets_to_transaction`.
 
 | Input outcome | Published records | Commit rule |
@@ -204,8 +230,9 @@ this version; a future consume-transform-produce implementation can use
 | Invalid envelope/JSON/UTF-8 | DLQ | Commit after DLQ acknowledgement |
 | Invalid request with all three identifiers | `calculation.failed` + DLQ | Commit after both acknowledgements |
 | Invalid request without all identifiers | DLQ | Commit after DLQ acknowledgement |
-| Successful calculation | `calculation.completed` | Commit after acknowledgement |
-| Unsupported calculation or terminal HTTP/calculation error | `calculation.failed` + DLQ | Commit after both acknowledgements |
+| Successful calculation | `calculation.started`, then `calculation.completed` | Commit after both acknowledgements |
+| Unsupported calculation | `calculation.failed` + DLQ; no started event | Commit after both acknowledgements |
+| Terminal HTTP/calculation error | `calculation.started`, then `calculation.failed` + DLQ | Commit after all acknowledgements |
 | Any producer failure/timeout | Not fully acknowledged | Do not commit; stop with a non-zero exit |
 
 Error codes are `INVALID_MESSAGE`, `UNSUPPORTED_SCHEMA_VERSION`, `UNSUPPORTED_CALCULATION`,
@@ -214,8 +241,8 @@ Error codes are `INVALID_MESSAGE`, `UNSUPPORTED_SCHEMA_VERSION`, `UNSUPPORTED_CA
 
 HTTP retries use exponential backoff with jitter. Timeouts, network errors, and HTTP
 `429/500/502/503/504` are retried; HTTP `400/401/403` and other non-configured statuses are not.
-Startup validation ensures the worst-case HTTP retry budget plus Kafka publication time remains
-below `KAFKA_MAX_POLL_INTERVAL_MS`.
+Startup validation ensures the worst-case HTTP retry budget plus two Kafka publication timeouts
+remains below `KAFKA_MAX_POLL_INTERVAL_MS`.
 
 ## Configuration
 

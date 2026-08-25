@@ -1,13 +1,19 @@
 """Application-facing structural interfaces."""
 
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from typing import Any, Protocol
 
-from calculation_worker.domain.models import HandlerResult, MessageContext
+from calculation_worker.domain.models import HandlerResult, MessageContext, OutgoingRecord
+
+
+class PublisherPort(Protocol):
+    """Synchronously publish records or raise before processing continues."""
+
+    def publish_and_wait(self, records: Sequence[OutgoingRecord]) -> None: ...
 
 
 class MessageHandler(Protocol):
-    """Handle one routed Kafka event without publishing or committing it."""
+    """Handle one routed Kafka event without committing its input offset."""
 
     event_type: str
 
@@ -16,5 +22,5 @@ class MessageHandler(Protocol):
         payload: Mapping[str, Any],
         context: MessageContext,
     ) -> HandlerResult:
-        """Return every outgoing record required for this input."""
+        """Return records that remain to be published before input commit."""
         ...

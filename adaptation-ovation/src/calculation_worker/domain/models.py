@@ -75,6 +75,13 @@ class _CalculationOutcome(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
 
+class CalculationStarted(_CalculationOutcome):
+    """Notification emitted before calculation work begins."""
+
+    event_type: Literal["calculation.started"] = "calculation.started"
+    status: Literal["started"] = "started"
+
+
 class CalculationCompleted(_CalculationOutcome):
     """Successful calculation output contract."""
 

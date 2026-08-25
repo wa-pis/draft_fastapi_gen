@@ -30,6 +30,11 @@ from calculation_worker.settings import Settings
 UPSTREAM_URL = "https://upstream.test/calculations/service-456"
 
 
+class _NoopPublisher:
+    def publish_and_wait(self, _records: object) -> None:
+        pass
+
+
 def _settings() -> Settings:
     return Settings(
         _env_file=None,
@@ -202,6 +207,7 @@ def _handle_request(upstream: UpstreamApiClient) -> HandlerResult:
             clock=lambda: datetime(2026, 8, 25, 12, 0, tzinfo=UTC),
         ),
         metrics=Metrics(CollectorRegistry()),
+        publisher=_NoopPublisher(),
     )
     return handler.handle(
         {
