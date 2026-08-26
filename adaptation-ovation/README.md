@@ -18,7 +18,14 @@ calculation-worker worker
 There is deliberately no status HTTP API. `calculation.started`, `calculation.completed`, and
 `calculation.failed` remain the public result contract.
 
+For a guided description of every repository area and its operational role, see
+[`docs/repository-overview.md`](docs/repository-overview.md).
+
 ## Processing model
+
+The renderable architecture diagram is maintained as
+[`docs/architecture.puml`](docs/architecture.puml). It uses only built-in PlantUML elements and
+does not require external themes or includes.
 
 ```text
 Kafka INTEGRATIONS

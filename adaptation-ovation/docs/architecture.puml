@@ -1,0 +1,103 @@
+@startuml
+title Adaptation Ovation — asynchronous calculation architecture
+
+left to right direction
+skinparam backgroundColor transparent
+skinparam componentStyle rectangle
+skinparam defaultTextAlignment center
+skinparam linetype ortho
+skinparam shadowing false
+
+actor "Requesting service" as requester
+actor "Lifecycle event consumer" as lifecycleConsumer
+actor "Prometheus" as prometheus
+
+queue "Kafka\nINTEGRATIONS topic" as integrations
+
+node "Ingress deployment\n(N independently scalable replicas)" as ingressDeployment {
+  component "calculation-worker ingress" as ingress
+  component "Validate and route" as validation
+  component "DBOSClient" as dbosClient
+  component "Metrics endpoint\n:8000" as ingressMetrics
+
+  ingress --> validation
+  validation --> dbosClient : valid\ncalculation.requested
+}
+
+database "PostgreSQL\nDBOS system schema" as postgres
+queue "calculation-queue\n(durable workflow queue)" as calculationQueue
+artifact "Workflow state\ninputs, checkpoints, outcome" as workflowState
+
+node "Worker deployment\n(M independently scalable replicas)" as workerDeployment {
+  component "calculation-worker worker\nstable executor_id\nconcurrency = 4 per replica" as worker
+  component "Metrics endpoint\n:8000" as workerMetrics
+
+  package "DBOS workflow — sequential steps" as workflow {
+    component "1. publish_started" as publishStarted
+    component "2. fetch_input" as fetchInput
+    component "3. calculate" as calculate
+    component "4. publish_completed" as publishCompleted
+    component "publish_failed\nthen ERROR" as publishFailed
+
+    publishStarted --> fetchInput
+    fetchInput --> calculate
+    calculate --> publishCompleted
+    fetchInput ..> publishFailed : handled failure
+    calculate ..> publishFailed : handled failure
+  }
+
+  worker --> publishStarted : execute
+}
+
+cloud "Upstream API" as upstreamApi
+component "Explicit migration job\nDBOS CLI" as migrationJob
+
+requester --> integrations : calculation.requested
+integrations --> ingress : consume in shared group
+ingress --> integrations : commit offset\nafter durable enqueue
+validation --> integrations : calculation.failed\nfor an identified invalid request
+
+dbosClient --> calculationQueue : enqueue\nworkflow_id = UUIDv5\n(request_id, calc_process)
+calculationQueue --> postgres : persist
+workflowState --> postgres : persist
+calculationQueue --> worker : claim pending workflow
+worker --> workflowState : read/write checkpoints
+workflowState ..> worker : recover incomplete step\nafter process crash
+
+fetchInput --> upstreamApi : HTTP request\nexactly one attempt
+publishStarted --> integrations : calculation.started
+publishCompleted --> integrations : calculation.completed
+publishFailed --> integrations : calculation.failed
+integrations --> lifecycleConsumer : lifecycle events\ndeduplicate by event_id
+prometheus --> ingressMetrics : scrape
+prometheus --> workerMetrics : scrape
+
+migrationJob --> postgres : migrate before runtime
+
+note bottom of ingressDeployment
+  Invalid identified requests emit calculation.failed.
+  Unidentified invalid messages are logged and committed.
+end note
+
+note bottom of postgres
+  No DLQ and no automatic replay path.
+  Normal exceptions are terminal and are never retried.
+  Crash recovery only resumes a step that lacks a durable checkpoint.
+end note
+
+note bottom of workerDeployment
+  A Kafka publication failure leaves the workflow in ERROR.
+  External side effects may be duplicated in the narrow
+  acknowledgement-before-checkpoint window.
+end note
+
+legend bottom
+  |= Runtime property |= Value |
+  | Public transport | Kafka |
+  | Durable internal queue | PostgreSQL / DBOS |
+  | Process roles | ingress and worker |
+  | Normal retries | disabled |
+  | Dead-letter queue | absent |
+endlegend
+
+@enduml
