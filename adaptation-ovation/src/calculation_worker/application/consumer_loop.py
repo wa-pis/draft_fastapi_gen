@@ -44,6 +44,8 @@ class StopSignal(Protocol):
 
     def is_set(self) -> bool: ...
 
+    def wait(self, timeout: float) -> bool: ...
+
 
 class ConsumerLoop:
     """Process one Kafka message at a time until stopped or an error escapes."""

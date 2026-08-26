@@ -34,11 +34,11 @@ class UpstreamError(CalculationWorkerError):
 
 
 class UpstreamTimeoutError(UpstreamError):
-    """The upstream API exhausted its timeout retries."""
+    """The single upstream API attempt timed out."""
 
 
 class UpstreamNetworkError(UpstreamError):
-    """The upstream API exhausted its network-error retries."""
+    """The single upstream API attempt failed at the network layer."""
 
 
 class UpstreamHttpError(UpstreamError):
@@ -63,3 +63,11 @@ class ConsumeError(CalculationWorkerError):
 
 class ConfigurationError(CalculationWorkerError):
     """The worker cannot safely start with its current configuration."""
+
+
+class TerminalCalculationError(CalculationWorkerError):
+    """A sanitized terminal error used as the persisted DBOS workflow outcome."""
+
+    def __init__(self, code: str) -> None:
+        self.code = code
+        super().__init__(f"Calculation workflow failed: {code}")

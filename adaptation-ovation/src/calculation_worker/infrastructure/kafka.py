@@ -169,7 +169,6 @@ class KafkaPublisher:
             else Producer(cast(dict[str, Any], settings.kafka_producer_config()))
         )
         self._metrics = metrics
-        self._dlq_topic = settings.kafka_dlq_topic
         self._publish_timeout_seconds = settings.kafka_publish_timeout_seconds
         self._shutdown_flush_timeout_seconds = settings.kafka_shutdown_flush_timeout_seconds
 
@@ -204,10 +203,7 @@ class KafkaPublisher:
                 acknowledged_by_topic[topic] += 1
                 outcome = "success" if error is None else "error"
                 self._metrics.kafka_publish.labels(topic=topic, outcome=outcome).inc()
-                if error is None:
-                    if topic == self._dlq_topic:
-                        self._metrics.dlq_messages.inc()
-                else:
+                if error is not None:
                     delivery_error_count += 1
 
             return callback

@@ -98,40 +98,6 @@ class CalculationFailed(_CalculationOutcome):
     error: EventError
 
 
-class DeadLetterHeader(BaseModel):
-    """A source Kafka header encoded so any byte value is JSON-safe."""
-
-    name: str
-    value_base64: str | None
-
-    model_config = ConfigDict(extra="forbid")
-
-
-class DeadLetterError(BaseModel):
-    """Sanitized reason for placing an input record on the DLQ."""
-
-    code: str
-    message: str
-
-    model_config = ConfigDict(extra="forbid")
-
-
-class DeadLetterRecord(BaseModel):
-    """JSON-safe copy of a Kafka record that could not be processed."""
-
-    source_topic: str
-    source_partition: int
-    source_offset: int
-    source_key_base64: str | None
-    source_value_base64: str
-    source_headers: tuple[DeadLetterHeader, ...] = ()
-    error: DeadLetterError
-    failed_at: AwareDatetime
-    service: str
-
-    model_config = ConfigDict(extra="forbid")
-
-
 @dataclass(frozen=True, slots=True)
 class MessageContext:
     """Source Kafka metadata made available to message handlers."""
@@ -142,6 +108,18 @@ class MessageContext:
     key: bytes | None
     headers: tuple[tuple[str, bytes | None], ...]
     raw_value: bytes = b""
+
+
+class CalculationJob(BaseModel):
+    """Durable, JSON-serializable input for the calculation workflow."""
+
+    request: CalculationRequested
+
+    model_config = ConfigDict(extra="forbid")
+
+    @classmethod
+    def create(cls, request: CalculationRequested) -> CalculationJob:
+        return cls(request=request)
 
 
 @dataclass(frozen=True, slots=True)

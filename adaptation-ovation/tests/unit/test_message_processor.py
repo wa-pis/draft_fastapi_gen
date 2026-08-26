@@ -1,6 +1,5 @@
 import json
-from base64 import b64encode
-from collections.abc import Mapping, Sequence
+from collections.abc import Mapping
 from datetime import UTC, datetime
 from typing import Any
 
@@ -8,18 +7,16 @@ import pytest
 from prometheus_client import CollectorRegistry
 
 from calculation_worker.application.calculation_requested_handler import (
-    CalculationRequestedMessageHandler,
+    CalculationRequestedIngressHandler,
 )
 from calculation_worker.application.event_factory import EventFactory
 from calculation_worker.application.message_processor import MessageProcessor
 from calculation_worker.application.registries import MessageHandlerRegistry
-from calculation_worker.calculations.registry import CalculationRegistry
 from calculation_worker.domain.models import (
     CalculationFailed,
-    DeadLetterRecord,
+    CalculationJob,
     HandlerResult,
     MessageContext,
-    OutgoingRecord,
 )
 from calculation_worker.infrastructure.observability import Metrics
 
@@ -41,9 +38,9 @@ class RecordingHandler:
         return HandlerResult(records=(), outcome="completed")
 
 
-class RejectingPublisher:
-    def publish_and_wait(self, _records: Sequence[OutgoingRecord]) -> None:
-        raise AssertionError("invalid or unsupported requests must not publish started")
+class RejectingQueue:
+    def enqueue(self, _job: CalculationJob) -> str:
+        raise AssertionError("invalid requests must not be enqueued")
 
 
 def _context() -> MessageContext:
@@ -64,7 +61,6 @@ def _processor(handler: RecordingHandler | None = None) -> MessageProcessor:
         message_registry=registry,
         event_factory=EventFactory(
             output_topic="INTEGRATIONS",
-            dlq_topic="INTEGRATIONS.DLQ",
             service_name="calculation-worker",
             clock=lambda: FIXED_TIME,
         ),
@@ -104,28 +100,28 @@ def test_event_without_registered_handler_is_ignored(event_type: str) -> None:
     assert result == HandlerResult(records=(), outcome="ignored")
 
 
-def test_invalid_json_is_sent_to_dlq() -> None:
+def test_invalid_json_is_discarded() -> None:
     payload = b'{"event_type":'
 
     result = _processor().process(payload, _context())
 
-    _assert_invalid_dlq(result, payload)
+    assert result == HandlerResult(records=(), outcome="invalid")
 
 
-def test_json_array_is_sent_to_dlq() -> None:
+def test_json_array_is_discarded() -> None:
     payload = b'["calculation.requested"]'
 
     result = _processor().process(payload, _context())
 
-    _assert_invalid_dlq(result, payload)
+    assert result == HandlerResult(records=(), outcome="invalid")
 
 
-def test_missing_event_type_is_sent_to_dlq() -> None:
+def test_missing_event_type_is_discarded() -> None:
     payload = b'{"schema_version":1,"request_id":"request-123"}'
 
     result = _processor().process(payload, _context())
 
-    _assert_invalid_dlq(result, payload)
+    assert result == HandlerResult(records=(), outcome="invalid")
 
 
 @pytest.mark.parametrize(
@@ -136,7 +132,7 @@ def test_missing_event_type_is_sent_to_dlq() -> None:
         {"schema_version": 1, "occurred_at": "not-a-datetime"},
     ],
 )
-def test_invalid_known_request_with_identifiers_creates_failed_and_dlq(
+def test_invalid_known_request_with_identifiers_creates_failed_event(
     invalid_field: dict[str, object],
 ) -> None:
     data: dict[str, object] = {
@@ -148,46 +144,31 @@ def test_invalid_known_request_with_identifiers_creates_failed_and_dlq(
     }
     result = _calculation_processor().process(json.dumps(data).encode(), _context())
 
-    assert len(result.records) == 2
+    assert len(result.records) == 1
     assert isinstance(result.records[0].value, CalculationFailed)
-    assert isinstance(result.records[1].value, DeadLetterRecord)
 
 
-def test_invalid_known_request_without_identifiers_creates_only_dlq() -> None:
+def test_invalid_known_request_without_identifiers_is_discarded() -> None:
     payload = b'{"event_type":"calculation.requested"}'
 
     result = _calculation_processor().process(payload, _context())
 
-    assert len(result.records) == 1
-    assert isinstance(result.records[0].value, DeadLetterRecord)
-
-
-def _assert_invalid_dlq(result: HandlerResult, source_payload: bytes) -> None:
-    assert result.outcome == "invalid"
-    assert len(result.records) == 1
-    record = result.records[0]
-    assert record.topic == "INTEGRATIONS.DLQ"
-    assert record.key == b"request-123"
-    assert isinstance(record.value, DeadLetterRecord)
-    assert record.value.error.code == "INVALID_MESSAGE"
-    assert record.value.source_value_base64 == b64encode(source_payload).decode("ascii")
+    assert result.records == ()
 
 
 def _calculation_processor() -> MessageProcessor:
     metrics = Metrics(CollectorRegistry())
     factory = EventFactory(
         output_topic="INTEGRATIONS",
-        dlq_topic="INTEGRATIONS.DLQ",
         service_name="calculation-worker",
         clock=lambda: FIXED_TIME,
     )
     registry = MessageHandlerRegistry()
     registry.register(
-        CalculationRequestedMessageHandler(
-            calculation_registry=CalculationRegistry(),
+        CalculationRequestedIngressHandler(
+            queue=RejectingQueue(),
             event_factory=factory,
             metrics=metrics,
-            publisher=RejectingPublisher(),
         )
     )
     return MessageProcessor(registry, factory, metrics)

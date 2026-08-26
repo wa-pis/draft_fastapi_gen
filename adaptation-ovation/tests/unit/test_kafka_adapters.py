@@ -135,7 +135,7 @@ def test_sync_commit_rejects_per_partition_error() -> None:
     assert native.commit_asynchronous is False
 
 
-def test_publisher_waits_for_every_callback_and_counts_dlq_success() -> None:
+def test_publisher_waits_for_every_callback() -> None:
     native = FakeNativeProducer()
     metrics = Metrics()
     publisher = KafkaPublisher(_settings(), metrics, cast(Any, native))
@@ -147,9 +147,9 @@ def test_publisher_waits_for_every_callback_and_counts_dlq_success() -> None:
             headers=(("trace", b"one"),),
         ),
         OutgoingRecord(
-            topic="INTEGRATIONS.DLQ",
+            topic="INTEGRATIONS",
             key=b"request-1",
-            value={"error": {"code": "INVALID_MESSAGE"}},
+            value={"status": "second"},
         ),
     )
 
@@ -158,7 +158,6 @@ def test_publisher_waits_for_every_callback_and_counts_dlq_success() -> None:
     assert len(native.produced) == 2
     assert native.produced[0]["key"] == b"request-1"
     assert json.loads(cast(bytes, native.produced[0]["value"])) == {"status": "ok"}
-    assert _counter_value(metrics.dlq_messages, "dlq_messages_total") == 1
 
 
 def test_callback_error_fails_even_when_flush_queue_is_empty() -> None:
@@ -171,7 +170,7 @@ def test_callback_error_fails_even_when_flush_queue_is_empty() -> None:
     records = (
         _record(),
         OutgoingRecord(
-            topic="INTEGRATIONS.DLQ",
+            topic="INTEGRATIONS",
             key="request-1",
             value={"error": "failed"},
         ),
@@ -192,7 +191,7 @@ def test_callback_error_fails_even_when_flush_queue_is_empty() -> None:
     assert (
         _labeled_counter_value(
             metrics.kafka_publish,
-            topic="INTEGRATIONS.DLQ",
+            topic="INTEGRATIONS",
             outcome="error",
         )
         == 1
@@ -291,6 +290,7 @@ def _settings(**overrides: object) -> Settings:
     values: dict[str, object] = {
         "UPSTREAM_API_BASE_URL": "http://upstream.test",
         "UPSTREAM_API_TOKEN": "secret",
+        "DBOS_SYSTEM_DATABASE_URL": "postgresql://test:test@localhost/test",
     }
     values.update(overrides)
     return Settings.model_validate(values)

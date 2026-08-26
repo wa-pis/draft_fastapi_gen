@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 from typing import Annotated, Any, Literal, Self
 
 from pydantic import (
@@ -36,7 +37,6 @@ class Settings(BaseSettings):
         default="kafka:9092", alias="KAFKA_BOOTSTRAP_SERVERS"
     )
     kafka_topic: NonBlankString = Field(default="INTEGRATIONS", alias="KAFKA_TOPIC")
-    kafka_dlq_topic: NonBlankString = Field(default="INTEGRATIONS.DLQ", alias="KAFKA_DLQ_TOPIC")
     kafka_group_id: NonBlankString = Field(default="calculation-worker-v1", alias="KAFKA_GROUP_ID")
     kafka_client_id: NonBlankString = Field(
         default="calculation-worker-local", alias="KAFKA_CLIENT_ID"
@@ -73,11 +73,21 @@ class Settings(BaseSettings):
         default=None, alias="KAFKA_SSL_CA_LOCATION"
     )
 
-    upstream_api_base_url: AnyHttpUrl = Field(alias="UPSTREAM_API_BASE_URL")
+    dbos_system_database_url: SecretStr = Field(alias="DBOS_SYSTEM_DATABASE_URL", repr=False)
+    dbos_executor_id: NonBlankString | None = Field(default=None, alias="DBOS_EXECUTOR_ID")
+    dbos_application_version: NonBlankString = Field(default="v1", alias="DBOS_APPLICATION_VERSION")
+    dbos_system_schema: NonBlankString = Field(default="dbos", alias="DBOS_SYSTEM_SCHEMA")
+    dbos_worker_concurrency: PositiveInt = Field(default=4, alias="DBOS_WORKER_CONCURRENCY")
+    dbos_max_recovery_attempts: PositiveInt = Field(default=3, alias="DBOS_MAX_RECOVERY_ATTEMPTS")
+    dbos_shutdown_grace_seconds: int = Field(default=30, ge=0, alias="DBOS_SHUTDOWN_GRACE_SECONDS")
+
+    upstream_api_base_url: AnyHttpUrl | None = Field(default=None, alias="UPSTREAM_API_BASE_URL")
     upstream_api_path_template: str = Field(
         default="/calculations/{calc_id}", alias="UPSTREAM_API_PATH_TEMPLATE"
     )
-    upstream_api_token: SecretStr = Field(alias="UPSTREAM_API_TOKEN", repr=False)
+    upstream_api_token: SecretStr | None = Field(
+        default=None, alias="UPSTREAM_API_TOKEN", repr=False
+    )
     upstream_connect_timeout_seconds: PositiveFloat = Field(
         default=5.0, alias="UPSTREAM_CONNECT_TIMEOUT_SECONDS"
     )
@@ -94,17 +104,6 @@ class Settings(BaseSettings):
     upstream_max_keepalive_connections: PositiveInt = Field(
         default=10, alias="UPSTREAM_MAX_KEEPALIVE_CONNECTIONS"
     )
-    upstream_max_attempts: PositiveInt = Field(default=3, alias="UPSTREAM_MAX_ATTEMPTS")
-    upstream_retry_min_wait_seconds: float = Field(
-        default=0.5, ge=0, alias="UPSTREAM_RETRY_MIN_WAIT_SECONDS"
-    )
-    upstream_retry_max_wait_seconds: float = Field(
-        default=5.0, ge=0, alias="UPSTREAM_RETRY_MAX_WAIT_SECONDS"
-    )
-    upstream_retryable_status_codes_csv: str = Field(
-        default="429,500,502,503,504", alias="UPSTREAM_RETRYABLE_STATUS_CODES"
-    )
-
     metrics_port: int = Field(default=8000, ge=1, le=65_535, alias="METRICS_PORT")
 
     def __init__(self, **values: Any) -> None:
@@ -118,6 +117,9 @@ class Settings(BaseSettings):
         "kafka_sasl_username",
         "kafka_sasl_password",
         "kafka_ssl_ca_location",
+        "dbos_executor_id",
+        "upstream_api_base_url",
+        "upstream_api_token",
         mode="before",
     )
     @classmethod
@@ -126,8 +128,8 @@ class Settings(BaseSettings):
 
     @field_validator("upstream_api_token")
     @classmethod
-    def token_must_not_be_blank(cls, value: SecretStr) -> SecretStr:
-        if not value.get_secret_value().strip():
+    def token_must_not_be_blank(cls, value: SecretStr | None) -> SecretStr | None:
+        if value is not None and not value.get_secret_value().strip():
             raise ValueError("UPSTREAM_API_TOKEN must not be blank")
         return value
 
@@ -141,8 +143,6 @@ class Settings(BaseSettings):
 
     @model_validator(mode="after")
     def validate_runtime_budget_and_security(self) -> Self:
-        if self.kafka_topic == self.kafka_dlq_topic:
-            raise ValueError("KAFKA_TOPIC and KAFKA_DLQ_TOPIC must differ")
         if self.kafka_delivery_timeout_ms < self.kafka_request_timeout_ms:
             raise ValueError("KAFKA_DELIVERY_TIMEOUT_MS must be at least KAFKA_REQUEST_TIMEOUT_MS")
         if self.kafka_publish_timeout_seconds < self.kafka_delivery_timeout_ms / 1000:
@@ -159,7 +159,9 @@ class Settings(BaseSettings):
             raise ValueError("SASL mechanism, username, and password must be configured together")
 
         base_url = self.upstream_api_base_url
-        if base_url.username or base_url.password:
+        if (base_url is None) != (self.upstream_api_token is None):
+            raise ValueError("UPSTREAM_API_BASE_URL and UPSTREAM_API_TOKEN must be set together")
+        if base_url is not None and (base_url.username or base_url.password):
             raise ValueError("UPSTREAM_API_BASE_URL must not contain credentials")
         if (
             not self.upstream_api_path_template.startswith("/")
@@ -171,42 +173,30 @@ class Settings(BaseSettings):
             raise ValueError(
                 "UPSTREAM_API_PATH_TEMPLATE must be an absolute path with one {calc_id} placeholder"
             )
-        if self.upstream_retry_min_wait_seconds > self.upstream_retry_max_wait_seconds:
-            raise ValueError("UPSTREAM_RETRY_MIN_WAIT_SECONDS cannot exceed the maximum wait")
         if self.upstream_max_keepalive_connections > self.upstream_max_connections:
             raise ValueError("UPSTREAM_MAX_KEEPALIVE_CONNECTIONS cannot exceed max connections")
-
-        _ = self.upstream_retryable_status_codes
-        per_attempt_seconds = (
-            self.upstream_connect_timeout_seconds
-            + self.upstream_read_timeout_seconds
-            + self.upstream_write_timeout_seconds
-            + self.upstream_pool_timeout_seconds
-        )
-        retry_budget_seconds = (
-            self.upstream_max_attempts * per_attempt_seconds
-            + (self.upstream_max_attempts - 1) * self.upstream_retry_max_wait_seconds
-        )
-        publish_budget_seconds = 2 * self.kafka_publish_timeout_seconds
-        if retry_budget_seconds + publish_budget_seconds >= self.kafka_max_poll_interval_ms / 1000:
-            raise ValueError(
-                "HTTP retry and Kafka publication budgets must fit KAFKA_MAX_POLL_INTERVAL_MS"
-            )
+        database_url = self.dbos_system_database_url.get_secret_value()
+        if not database_url.startswith(("postgresql://", "postgresql+psycopg://")):
+            raise ValueError("DBOS_SYSTEM_DATABASE_URL must be a PostgreSQL URL")
+        if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", self.dbos_system_schema):
+            raise ValueError("DBOS_SYSTEM_SCHEMA must be a valid PostgreSQL identifier")
         return self
 
-    @property
-    def upstream_retryable_status_codes(self) -> frozenset[int]:
-        try:
-            codes = frozenset(
-                int(value.strip())
-                for value in self.upstream_retryable_status_codes_csv.split(",")
-                if value.strip()
+    def require_worker_executor_id(self) -> str:
+        if self.dbos_executor_id is None:
+            raise ConfigurationError("DBOS_EXECUTOR_ID is required in worker mode")
+        return self.dbos_executor_id
+
+    def validate_worker_mode(self) -> None:
+        self.require_worker_executor_id()
+        self.require_upstream_config()
+
+    def require_upstream_config(self) -> tuple[AnyHttpUrl, SecretStr]:
+        if self.upstream_api_base_url is None or self.upstream_api_token is None:
+            raise ConfigurationError(
+                "UPSTREAM_API_BASE_URL and UPSTREAM_API_TOKEN are required in worker mode"
             )
-        except ValueError as exc:
-            raise ValueError("UPSTREAM_RETRYABLE_STATUS_CODES must contain integers") from exc
-        if not codes or any(code < 100 or code > 599 for code in codes):
-            raise ValueError("UPSTREAM_RETRYABLE_STATUS_CODES contains an invalid HTTP status")
-        return codes
+        return self.upstream_api_base_url, self.upstream_api_token
 
     def kafka_security_config(self) -> dict[str, object]:
         config: dict[str, object] = {"security.protocol": self.kafka_security_protocol}

@@ -140,17 +140,14 @@ class MessageProcessor:
     def _invalid(self, context: MessageContext, failure: Failure) -> HandlerResult:
         self._metrics.kafka_messages_invalid.inc()
         logger.warning(
-            "Invalid Kafka message will be sent to DLQ",
+            "Invalid Kafka message will be discarded",
             extra={
                 **_context_log_fields(context),
                 "error_code": failure.code,
                 "outcome": "invalid",
             },
         )
-        return HandlerResult(
-            records=(self._event_factory.dead_letter(context, failure),),
-            outcome="invalid",
-        )
+        return HandlerResult(records=(), outcome="invalid")
 
 
 def _reject_json_constant(_: str) -> NoReturn:

@@ -3,13 +3,24 @@
 from collections.abc import Mapping, Sequence
 from typing import Any, Protocol
 
-from calculation_worker.domain.models import HandlerResult, MessageContext, OutgoingRecord
+from calculation_worker.domain.models import (
+    CalculationJob,
+    HandlerResult,
+    MessageContext,
+    OutgoingRecord,
+)
 
 
 class PublisherPort(Protocol):
     """Synchronously publish records or raise before processing continues."""
 
     def publish_and_wait(self, records: Sequence[OutgoingRecord]) -> None: ...
+
+
+class CalculationQueuePort(Protocol):
+    """Durably enqueue a validated calculation before Kafka is committed."""
+
+    def enqueue(self, job: CalculationJob) -> str: ...
 
 
 class MessageHandler(Protocol):
