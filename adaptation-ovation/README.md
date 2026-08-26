@@ -1,430 +1,195 @@
 # Adaptation Ovation
 
-`adaptation-ovation` is a synchronous Python 3.13 Kafka worker. It consumes events from the shared
-`INTEGRATIONS` topic, routes them by `event_type`, fetches calculation input from an upstream HTTP
-API, runs the selected calculation, and publishes the result back to `INTEGRATIONS`. Terminally
-failed inputs are also copied to `INTEGRATIONS.DLQ`.
+`adaptation-ovation` is a Python 3.12 calculation service with Kafka as its public transport and
+PostgreSQL/DBOS as its durable internal queue. Long calculations do not block the Kafka consumer.
+The same PyInstaller binary runs in one of two explicit modes:
 
-The worker deliberately processes one record at a time. Parallelism comes from running more
-instances in the same Kafka consumer group, not from `asyncio`, a thread pool, or manually assigning
-partitions.
+```bash
+calculation-worker ingress
+calculation-worker worker
+```
 
-## Processing and architecture
+- `ingress` consumes the shared `INTEGRATIONS` topic, validates messages, durably enqueues valid
+  calculation requests in PostgreSQL, and only then commits the Kafka offset.
+- `worker` runs DBOS workflows from `calculation-queue`, fetches input, calculates, and publishes
+  lifecycle events back to Kafka. Each replica executes at most
+  `DBOS_WORKER_CONCURRENCY` workflows concurrently (default: 4).
 
-The hot path is continuous:
+There is deliberately no status HTTP API. `calculation.started`, `calculation.completed`, and
+`calculation.failed` remain the public result contract.
+
+## Processing model
 
 ```text
-poll
-  -> decode UTF-8 and JSON object
-  -> validate the minimal event envelope
-  -> route by MessageHandlerRegistry
-  -> route calculation.requested by CalculationRegistry
-  -> publish calculation.started and wait for its delivery acknowledgement
-  -> fetch upstream data and calculate
-  -> publish calculation.completed or calculation.failed (+ DLQ)
-  -> wait for every delivery acknowledgement
-  -> synchronously commit the input offset
-  -> next poll
+Kafka INTEGRATIONS
+        |
+        v
+  ingress process
+  validate -> DBOS enqueue -> Kafka commit
+        |                         \
+        |                          -> invalid: failed or discard -> commit
+        v
+PostgreSQL DBOS queue
+        |
+        v
+  worker process (4 concurrent workflows per replica)
+  started -> fetch input -> calculate -> completed
+                              \
+                               -> terminal error -> failed
 ```
 
-Unknown, valid `event_type` values are intentionally ignored and committed. This makes the shared
-topic forward compatible. Malformed UTF-8/JSON, a JSON value that is not an object, or an invalid
-minimal envelope is published to the DLQ before its input offset is committed.
+Unknown but valid `event_type` values are ignored and committed, allowing unrelated events on the
+shared topic. Invalid UTF-8/JSON/envelopes are logged, counted, discarded, and committed because the
+deployment has no separate dead-letter topic. An invalid `calculation.requested` that still contains
+`request_id`, `calc_id`, and `calc_process` emits `calculation.failed`; without those identifiers it
+is discarded after logging.
 
-```text
-src/calculation_worker/
-  main.py                         signals and process exit status
-  bootstrap.py                    explicit dependency composition
-  settings.py                     validated environment configuration
-  application/
-    consumer_loop.py              poll -> process -> publish -> commit
-    message_processor.py          envelope validation and event routing
-    registries.py                 MessageHandlerRegistry
-    calculation_requested_handler.py
-    event_factory.py              started, completed, failed, and DLQ records
-  calculations/
-    base.py                       CalculationHandler protocol
-    registry.py                   CalculationRegistry
-    example.py                    example calculation
-  domain/models.py                input/output contracts
-  infrastructure/
-    kafka.py                      confluent-kafka adapters
-    upstream.py                   long-lived httpx client and retries
-    observability.py              JSON logging and Prometheus metrics
+Each durable job contains only the validated calculation request. There is no DLQ and no automatic
+replay path.
+
+### Durable identity and duplicates
+
+The logical job key is `(request_id, calc_process)`. It is converted to a deterministic UUIDv5 and
+used as the DBOS workflow ID. Re-enqueueing the same logical job returns the existing workflow; it
+does not start a second calculation and does not replace the first payload. Workflow history is not
+automatically deleted, so this deduplication remains effective until an operator explicitly applies
+a retention policy.
+
+Lifecycle `event_id` values are also deterministic UUIDv5 values. Downstream Kafka consumers must
+deduplicate by `event_id`: no database transaction can atomically cover both a PostgreSQL workflow
+checkpoint and an external Kafka acknowledgement.
+
+## Failure and recovery policy
+
+Normal failures are **never retried**:
+
+- Every DBOS step declares `retries_allowed=False`.
+- The upstream HTTP client makes exactly one request. Timeouts, network failures, HTTP 429/5xx,
+  other non-2xx responses, invalid JSON, and calculation exceptions are terminal.
+- A handled calculation failure publishes `calculation.failed`, then leaves the DBOS workflow in
+  `ERROR`.
+- A Kafka publication failure also leaves the workflow in `ERROR`; automatic publication retry is
+  disabled. An operator may explicitly inspect and resume/fork a workflow.
+
+Crash recovery is different from retrying a failed task. DBOS checkpoints each completed step. If
+an executor process dies, a replacement with the same `DBOS_EXECUTOR_ID` and
+`DBOS_APPLICATION_VERSION` recovers its pending workflows. Completed steps are skipped; only the
+step that had not durably completed can execute again. For example, an acknowledged and
+checkpointed `calculation.started` is not intentionally republished. There is still a narrow
+ack-before-checkpoint window in which any external side effect can occur twice.
+
+`DBOS_MAX_RECOVERY_ATTEMPTS` limits repeated process-crash recovery (default: 3). It is not a retry
+count for exceptions. Without DBOS Conductor, stable executor identity is operationally required:
+when `worker-a` disappears, a replacement must come up as `worker-a` to recover its pending work.
+
+On SIGTERM/SIGINT the worker stops taking new work, allows active workflows up to
+`DBOS_SHUTDOWN_GRACE_SECONDS` (default: 30), then exits. Any incomplete workflow is recovered by a
+replacement with the same executor ID.
+
+## Workflow and extension contract
+
+The durable workflow steps are:
+
+1. `calculation.publish_started`
+2. `calculation.fetch_input`
+3. `calculation.calculate`
+4. `calculation.publish_completed`
+
+The terminal error path adds `calculation.publish_failed`. A calculation implementation registers a
+unique `process_name` and implements:
+
+```python
+def fetch_input(request: CalculationRequested) -> Mapping[str, Any]: ...
+
+
+def calculate(
+    request: CalculationRequested,
+    input_data: Mapping[str, Any],
+) -> CalculationResult: ...
 ```
 
-`bootstrap.py` creates settings, Kafka consumer and producer adapters, one long-lived
-`httpx.Client`, both registries, handlers, processor, loop, metrics, and logging. Registration is
-explicit: there are no mutable global registries, dynamic imports, or plugin framework.
-`CalculationRequestedMessageHandler` receives the same publisher as the consumer loop so it can
-acknowledge the prerequisite `calculation.started` event before invoking calculation code; its
-returned `HandlerResult` contains only the terminal records still awaiting publication.
-
-### The two registries
-
-| Registry | Key | Responsibility | Unknown key |
-| --- | --- | --- | --- |
-| `MessageHandlerRegistry` | `handler.event_type` | Routes a Kafka event to a message handler | Returns `None`; the event is ignored and committed |
-| `CalculationRegistry` | `handler.process_name` | Selects calculation logic inside `calculation.requested` | Raises `UnsupportedCalculationError`, producing failed + DLQ records |
-
-Both reject duplicate registration. The consumer loop only understands `HandlerResult`, so adding a
-route never changes its publish/commit logic.
-
-To add a Kafka event type:
-
-1. Implement `MessageHandler` with a unique `event_type` and `handle(payload, context)`.
-2. Return a `HandlerResult` containing every outgoing record that remains to be published before the input offset is committed.
-3. Register the instance in `bootstrap.py`.
-
-To add a calculation:
-
-1. Implement `CalculationHandler` in `calculations/` with a unique `process_name`.
-2. Inject its dependencies through the constructor and implement `calculate(request)`.
-3. Register the instance in `CalculationRegistry` in `bootstrap.py`.
-
-Neither extension requires changes to `ConsumerLoop`, `MessageProcessor`, or
-`CalculationRequestedMessageHandler`.
-
-## Event contracts
-
-Identifiers are opaque, non-blank strings; they do not need to be UUIDs. Extra input fields are
-accepted. An input `occurred_at`, when present, must be timezone-aware. Output `occurred_at` and DLQ
-`failed_at` are processing timestamps generated in UTC.
-
-### `calculation.requested`
-
-Input topic: `INTEGRATIONS`.
-
-```json
-{
-  "event_id": "optional-upstream-id",
-  "event_type": "calculation.requested",
-  "schema_version": 1,
-  "source": "requesting-service",
-  "request_id": "request-123",
-  "calc_id": "service-456",
-  "calc_process": "example",
-  "occurred_at": "2026-08-25T12:00:00Z"
-}
-```
-
-### `calculation.started`
-
-Output topic: `INTEGRATIONS`; Kafka key: `request_id`. The broker acknowledges this event before
-the calculation implementation is called.
-
-```json
-{
-  "event_id": "deterministic-uuid-v5",
-  "event_type": "calculation.started",
-  "schema_version": 1,
-  "source": "calculation-worker",
-  "request_id": "request-123",
-  "calc_id": "service-456",
-  "calc_process": "example",
-  "status": "started",
-  "occurred_at": "2026-08-25T12:00:01Z"
-}
-```
-
-### `calculation.completed`
-
-Output topic: `INTEGRATIONS`; Kafka key: `request_id`.
-
-```json
-{
-  "event_id": "deterministic-uuid-v5",
-  "event_type": "calculation.completed",
-  "schema_version": 1,
-  "source": "calculation-worker",
-  "request_id": "request-123",
-  "calc_id": "service-456",
-  "calc_process": "example",
-  "status": "ok",
-  "result": {
-    "has_data": true,
-    "source_field_count": 4
-  },
-  "occurred_at": "2026-08-25T12:00:02Z"
-}
-```
-
-### `calculation.failed`
-
-Output topic: `INTEGRATIONS`; Kafka key: `request_id`. Error messages are sanitized and contain no
-stack trace, credentials, token, or upstream response body.
-
-```json
-{
-  "event_id": "deterministic-uuid-v5",
-  "event_type": "calculation.failed",
-  "schema_version": 1,
-  "source": "calculation-worker",
-  "request_id": "request-123",
-  "calc_id": "service-456",
-  "calc_process": "example",
-  "status": "error",
-  "error": {
-    "code": "UPSTREAM_TIMEOUT",
-    "message": "Upstream service did not respond in time",
-    "retryable": false
-  },
-  "occurred_at": "2026-08-25T12:00:32Z"
-}
-```
-
-### Dead-letter record
-
-Output topic: `INTEGRATIONS.DLQ`; Kafka key: the original key. The original key, value, and every
-header value are preserved as Base64 (Kafka header names remain strings), so arbitrary bytes are
-safe in JSON.
-
-```json
-{
-  "source_topic": "INTEGRATIONS",
-  "source_partition": 2,
-  "source_offset": 152,
-  "source_key_base64": "cmVxdWVzdC0xMjM=",
-  "source_value_base64": "eyJldmVudF90eXBlIjoiY2FsY3VsYXRpb24ucmVxdWVzdGVkIn0=",
-  "source_headers": [
-    {
-      "name": "trace-id",
-      "value_base64": "YWJjLTEyMw=="
-    }
-  ],
-  "error": {
-    "code": "INVALID_MESSAGE",
-    "message": "Message is not valid JSON"
-  },
-  "failed_at": "2026-08-25T12:00:00Z",
-  "service": "calculation-worker"
-}
-```
-
-## Delivery and failure policy
-
-The service provides **at-least-once** delivery. Producer idempotence (`enable.idempotence=true`,
-`acks=all`) protects producer retries, but it cannot make input processing exactly once. A process
-can publish an output and fail before committing the input offset, causing that input and its output
-to be produced again. Consumer auto-commit and auto-offset-store are disabled; every successful
-input is committed synchronously by the loop.
-
-Started, completed, and failed IDs use UUIDv5 with a fixed namespace and these names:
-
-```text
-request_id + ":" + calc_process + ":calculation.started
-request_id + ":" + calc_process + ":calculation.completed
-request_id + ":" + calc_process + ":calculation.failed
-```
-
-The same input therefore produces the same lifecycle IDs, while IDs for different lifecycle stages
-differ. Downstream consumers must deduplicate by `event_id`. A crash after `calculation.started` is
-acknowledged but before the input offset is committed can produce a duplicate started event and can
-leave a started event without a terminal event until redelivery. Kafka transactions are
-intentionally outside this version; a future consume-transform-produce implementation can use
-`send_offsets_to_transaction`.
-
-| Input outcome | Published records | Commit rule |
-| --- | --- | --- |
-| Unknown valid `event_type` | None | Commit immediately |
-| Invalid envelope/JSON/UTF-8 | DLQ | Commit after DLQ acknowledgement |
-| Invalid request with all three identifiers | `calculation.failed` + DLQ | Commit after both acknowledgements |
-| Invalid request without all identifiers | DLQ | Commit after DLQ acknowledgement |
-| Successful calculation | `calculation.started`, then `calculation.completed` | Commit after both acknowledgements |
-| Unsupported calculation | `calculation.failed` + DLQ; no started event | Commit after both acknowledgements |
-| Terminal HTTP/calculation error | `calculation.started`, then `calculation.failed` + DLQ | Commit after all acknowledgements |
-| Any producer failure/timeout | Not fully acknowledged | Do not commit; stop with a non-zero exit |
-
-Error codes are `INVALID_MESSAGE`, `UNSUPPORTED_SCHEMA_VERSION`, `UNSUPPORTED_CALCULATION`,
-`UPSTREAM_TIMEOUT`, `UPSTREAM_NETWORK_ERROR`, `UPSTREAM_HTTP_ERROR`,
-`INVALID_UPSTREAM_RESPONSE`, and `CALCULATION_ERROR`.
-
-HTTP retries use exponential backoff with jitter. Timeouts, network errors, and HTTP
-`429/500/502/503/504` are retried; HTTP `400/401/403` and other non-configured statuses are not.
-Startup validation ensures the worst-case HTTP retry budget plus two Kafka publication timeouts
-remains below `KAFKA_MAX_POLL_INTERVAL_MS`.
+Register implementations in `build_worker_runtime`. Workflow code and configured instances must
+remain available under the same DBOS names while old workflow rows may still need recovery.
+Deploy workflow-incompatible code under a new `DBOS_APPLICATION_VERSION` and keep the old version
+running until its work drains.
 
 ## Configuration
 
-Copy the example and replace the upstream token and deployment-specific Kafka addresses/identity:
+Copy `.env.example` to `.env`. Important DBOS settings are:
 
-```bash
-cp .env.example .env
-```
-
-Only the upstream URL and token have no application default. Defaults for other values are useful
-locally, but production deployments should set Kafka identity, endpoints, security, timeouts, and
-resource limits explicitly. Empty optional SASL/SSL values are treated as unset. Passwords and the
-upstream token are secret fields and are excluded from settings representations and logs.
-
-| Variable | Required? / default | Purpose |
+| Variable | Required/default | Purpose |
 | --- | --- | --- |
-| `SERVICE_NAME` | Optional: `calculation-worker` | Event source, DLQ service, and log identity |
-| `LOG_LEVEL` | Optional: `INFO` | `DEBUG`, `INFO`, `WARNING`, `ERROR`, or `CRITICAL` |
-| `KAFKA_BOOTSTRAP_SERVERS` | Optional: `kafka:9092` | Kafka bootstrap brokers |
-| `KAFKA_TOPIC` | Optional: `INTEGRATIONS` | Shared input and result topic |
-| `KAFKA_DLQ_TOPIC` | Optional: `INTEGRATIONS.DLQ` | Dead-letter topic; must differ from the input topic |
-| `KAFKA_GROUP_ID` | Optional: `calculation-worker-v1` | Shared consumer group ID for every replica |
-| `KAFKA_CLIENT_ID` | Optional: `calculation-worker-local` | Client ID; make unique per replica |
-| `KAFKA_AUTO_OFFSET_RESET` | Optional: `earliest` | `earliest`, `latest`, or `error` |
-| `KAFKA_MAX_POLL_INTERVAL_MS` | Optional: `300000` | Maximum interval allowed between polls |
-| `KAFKA_SESSION_TIMEOUT_MS` | Optional: `45000` | Consumer group session timeout |
-| `KAFKA_DELIVERY_TIMEOUT_MS` | Optional: `30000` | Producer delivery deadline |
-| `KAFKA_REQUEST_TIMEOUT_MS` | Optional: `10000` | Producer request timeout; no greater than delivery timeout |
-| `KAFKA_POLL_TIMEOUT_SECONDS` | Optional: `1.0` | Bounded blocking poll duration |
-| `KAFKA_PUBLISH_TIMEOUT_SECONDS` | Optional: `35.0` | Whole outgoing batch deadline; covers delivery timeout |
-| `KAFKA_SHUTDOWN_FLUSH_TIMEOUT_SECONDS` | Optional: `5.0` | Bounded producer flush during shutdown |
-| `KAFKA_SECURITY_PROTOCOL` | Optional: `PLAINTEXT` | Kafka security protocol, for example `SASL_SSL` |
-| `KAFKA_SASL_MECHANISM` | Conditional | Required with SASL, for example `PLAIN` or `SCRAM-SHA-512` |
-| `KAFKA_SASL_USERNAME` | Conditional | Required with SASL |
-| `KAFKA_SASL_PASSWORD` | Conditional, secret | Required with SASL |
-| `KAFKA_SSL_CA_LOCATION` | Optional, unset | CA bundle path for TLS |
-| `UPSTREAM_API_BASE_URL` | **Required** | HTTP(S) base URL without embedded credentials |
-| `UPSTREAM_API_PATH_TEMPLATE` | Optional: `/calculations/{calc_id}` | Absolute path containing exactly one `{calc_id}` placeholder |
-| `UPSTREAM_API_TOKEN` | **Required**, secret | Bearer token; `replace-me` in the example is not a real credential |
-| `UPSTREAM_CONNECT_TIMEOUT_SECONDS` | Optional: `5.0` | HTTP connect timeout per attempt |
-| `UPSTREAM_READ_TIMEOUT_SECONDS` | Optional: `30.0` | HTTP read timeout per attempt |
-| `UPSTREAM_WRITE_TIMEOUT_SECONDS` | Optional: `10.0` | HTTP write timeout per attempt |
-| `UPSTREAM_POOL_TIMEOUT_SECONDS` | Optional: `5.0` | HTTP pool acquisition timeout per attempt |
-| `UPSTREAM_MAX_CONNECTIONS` | Optional: `20` | Total pooled HTTP connections |
-| `UPSTREAM_MAX_KEEPALIVE_CONNECTIONS` | Optional: `10` | Keep-alive connections; no greater than total connections |
-| `UPSTREAM_MAX_ATTEMPTS` | Optional: `3` | Total HTTP attempts, including the first |
-| `UPSTREAM_RETRY_MIN_WAIT_SECONDS` | Optional: `0.5` | Minimum retry backoff |
-| `UPSTREAM_RETRY_MAX_WAIT_SECONDS` | Optional: `5.0` | Maximum jittered backoff |
-| `UPSTREAM_RETRYABLE_STATUS_CODES` | Optional: `429,500,502,503,504` | Comma-separated retryable HTTP statuses |
-| `METRICS_PORT` | Optional: `8000` | Prometheus HTTP server port |
+| `DBOS_SYSTEM_DATABASE_URL` | Required | PostgreSQL URL for DBOS system tables |
+| `DBOS_EXECUTOR_ID` | Worker only, required | Stable replica identity used for crash recovery |
+| `DBOS_APPLICATION_VERSION` | `v1` | Version that owns and executes enqueued workflows |
+| `DBOS_SYSTEM_SCHEMA` | `dbos` | PostgreSQL schema containing DBOS tables |
+| `DBOS_WORKER_CONCURRENCY` | `4` | Maximum concurrent workflows per executor |
+| `DBOS_MAX_RECOVERY_ATTEMPTS` | `3` | Maximum process-crash recoveries, not error retries |
+| `DBOS_SHUTDOWN_GRACE_SECONDS` | `30` | Grace period for active workflows during shutdown |
 
-`calc_id` is percent-encoded before insertion into the upstream path. One pooled `httpx.Client` is
-used for the process lifetime and closed at shutdown.
+`UPSTREAM_API_BASE_URL` and `UPSTREAM_API_TOKEN` are required only in worker mode. Kafka SASL/SSL,
+timeouts, topic names, and metrics options are documented with defaults in `.env.example`.
+`KAFKA_CLIENT_ID` should be unique per ingress replica; every ingress replica shares
+`KAFKA_GROUP_ID`.
 
-## Local development
+The database URL and API/Kafka credentials use secret settings and are excluded from settings
+representations. Use a migration role for schema changes and a restricted runtime role for ingress
+and workers.
 
-Install [uv](https://docs.astral.sh/uv/), ensure Kafka and the upstream API are reachable, then:
+## Migrations and containers
+
+Migrations are explicit. Runtime processes configure DBOS with `run_migrations=False` and fail fast
+if the schema is absent or stale.
+
+Local migration command:
 
 ```bash
-uv sync
-cp .env.example .env
-# Edit .env: at minimum replace UPSTREAM_API_TOKEN and local endpoints.
-uv run calculation-worker
+uv run dbos migrate \
+  --sys-db-url "$DBOS_SYSTEM_DATABASE_URL" \
+  --schema "$DBOS_SYSTEM_SCHEMA" \
+  --app-role calculation_worker
 ```
 
-`.python-version` and `pyproject.toml` select Python 3.13. Useful checks are:
+The Dockerfile exposes separate targets:
 
 ```bash
+docker build --target migrations -t adaptation-ovation-migrations .
+docker run --rm adaptation-ovation-migrations \
+  --sys-db-url 'postgresql://migration:secret@postgres/calculations' \
+  --schema dbos \
+  --app-role calculation_worker
+
+docker build --target runtime -t adaptation-ovation .
+docker run --env-file .env adaptation-ovation /app/calculation-worker ingress
+docker run --env-file .env adaptation-ovation /app/calculation-worker worker
+```
+
+Run ingress and workers as separate deployments so they can scale independently. Multiple workers
+have no global concurrency cap: total capacity is `4 × worker replicas` by default.
+
+## Development and standalone build
+
+```bash
+uv sync --python 3.12 --group build
 uv run pytest
 uv run ruff check .
 uv run ruff format --check .
 uv run mypy src
 ```
 
-Build a standalone executable for the current operating system and architecture:
-
-```bash
-make build
-./dist/calculation-worker
-```
-
-PyInstaller writes its temporary build files under `build/`; neither build output directory is
-committed. Build the executable on the same operating system and architecture where it will run.
-
-## Consumer groups and scaling
-
-Every replica uses the same `KAFKA_GROUP_ID` and a unique `KAFKA_CLIENT_ID`. Each calls
-`consumer.subscribe([topic], on_assign=..., on_revoke=...)`; assignment and revocation callbacks log
-the affected partitions. The worker never calls `assign()` or derives a partition from a hostname,
-pod ordinal, or environment variable. Kafka therefore owns partition balancing and recovery.
-
-Scale by adding replicas with the same group ID. Each instance handles at most one record at a time,
-so maximum useful parallelism is the number of `INTEGRATIONS` partitions; additional replicas remain
-idle until a rebalance can assign them work.
-
-Inspect the topic and its partition count:
-
-```bash
-kafka-topics.sh \
-  --bootstrap-server kafka:9092 \
-  --describe \
-  --topic INTEGRATIONS
-```
-
-Inspect group members and assignments:
-
-```bash
-kafka-consumer-groups.sh \
-  --bootstrap-server kafka:9092 \
-  --describe \
-  --group calculation-worker-v1 \
-  --members \
-  --verbose
-```
-
-## Graceful shutdown
-
-`SIGTERM` and `SIGINT` set a stop flag. The loop stops polling for new work; if processing has
-already begun, it finishes publication and commits only after all required acknowledgements. A
-signal observed after a blocked poll but before processing leaves that record uncommitted for
-redelivery. Shutdown closes the consumer, performs a bounded producer flush, closes the long-lived
-HTTP client and metrics server, and then exits. There is no unbounded flush or shutdown wait.
-
-## Observability
-
-Logs are JSON on stdout. Depending on the operation they include `event_type`, `request_id`,
-`calc_id`, `calc_process`, `topic`, `partition`, `offset`, bounded `kafka_key`, `handler`,
-`processing_duration_ms`, `upstream_attempts`, `outcome`, and rebalance partition lists. Stack traces
-appear only on error logs. Secrets and full upstream responses are never logged.
-
-Prometheus metrics are exposed at `http://localhost:${METRICS_PORT}/metrics` without an application
-HTTP framework:
-
-- `kafka_messages_received_total`
-- `kafka_messages_ignored_total`
-- `kafka_messages_invalid_total`
-- `message_handler_calls_total{handler,status}`
-- `message_handler_duration_seconds{handler}`
-- `calculations_total{calc_process,status}`
-- `calculation_duration_seconds{calc_process}`
-- `upstream_requests_total{outcome}`
-- `upstream_request_duration_seconds`
-- `kafka_publish_total{topic,outcome}`
-- `dlq_messages_total`
-- `process_last_success_timestamp_seconds`
-
-Request IDs, calculation IDs, offsets, URLs, and exception messages are not metric labels.
-
-## Tests
-
-The default suite is broker-free and uses fake consumer/publisher adapters plus `respx` for HTTP:
-
-```bash
-uv run pytest
-```
-
-Integration tests are explicitly marked and require a working Docker daemon. They use
-`testcontainers` to start Kafka and verify multi-message processing, keys, deterministic event IDs,
-and committed-offset behavior:
+Docker-backed integration tests are opt-in:
 
 ```bash
 uv run pytest -m integration
 ```
 
-## Container
-
-Build the locked multi-stage image and run it with a read-only root filesystem:
+Build and smoke-test the one-file executable on the same OS/architecture where it will run:
 
 ```bash
-docker build -t adaptation-ovation .
-docker run --rm \
-  --read-only \
-  --tmpfs /tmp:rw,exec,nosuid,size=128m \
-  --env-file .env \
-  -p 8000:8000 \
-  adaptation-ovation
+make build
+./dist/calculation-worker --help
 ```
 
-The builder runs the same `make build` target used locally. The runtime is based on
-`python:3.13-slim`, receives only the PyInstaller executable from the builder (no source tree,
-virtual environment, or build tools), runs as an unprivileged user, and starts it with exec-form
-`CMD`. PyInstaller one-file
-executables unpack native libraries under `/tmp` at startup, so that explicitly mounted directory
-must be writable, executable, and at least 128 MB. When containerized, Kafka and upstream addresses
-must be reachable from the container; `localhost` refers to the container itself.
+PyInstaller explicitly collects DBOS, SQLAlchemy, and psycopg runtime modules. The binary still
+requires network access to PostgreSQL, Kafka, and the upstream API; it does not embed database
+credentials or configuration.

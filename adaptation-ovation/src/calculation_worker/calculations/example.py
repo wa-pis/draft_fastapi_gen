@@ -14,11 +14,18 @@ class ExampleCalculation:
     def __init__(self, upstream_client: UpstreamDataProvider) -> None:
         self._upstream_client = upstream_client
 
-    def calculate(self, request: CalculationRequested) -> CalculationResult:
-        source_data = self._upstream_client.get_data(request.calc_id)
+    def fetch_input(self, request: CalculationRequested) -> Mapping[str, Any]:
+        return self._upstream_client.get_data(request.calc_id)
+
+    def calculate(
+        self,
+        request: CalculationRequested,
+        input_data: Mapping[str, Any],
+    ) -> CalculationResult:
+        del request
         return CalculationResult(
             data={
                 "has_data": True,
-                "source_field_count": len(source_data),
+                "source_field_count": len(input_data),
             }
         )

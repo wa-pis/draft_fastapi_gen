@@ -1,11 +1,17 @@
 from __future__ import annotations
 
+import argparse
 import logging
 import signal
+from collections.abc import Sequence
 from threading import Event
 from types import FrameType
 
-from calculation_worker.bootstrap import Runtime, build_runtime
+from calculation_worker.bootstrap import (
+    Runtime,
+    build_ingress_runtime,
+    build_worker_runtime,
+)
 from calculation_worker.errors import ConfigurationError
 from calculation_worker.infrastructure.observability import configure_logging
 from calculation_worker.settings import Settings
@@ -13,10 +19,13 @@ from calculation_worker.settings import Settings
 logger = logging.getLogger(__name__)
 
 
-def main() -> int:
+def main(argv: Sequence[str] | None = None) -> int:
     configure_logging("INFO")
+    mode = _parse_mode(argv)
     try:
         settings = Settings()
+        if mode == "worker":
+            settings.validate_worker_mode()
     except (ConfigurationError, ValueError):
         logger.error(
             "Service configuration is invalid", extra={"error_code": "CONFIGURATION_ERROR"}
@@ -29,24 +38,34 @@ def main() -> int:
     runtime: Runtime | None = None
     exit_code = 0
     try:
-        runtime = build_runtime(settings, stop_signal)
+        runtime = (
+            build_ingress_runtime(settings, stop_signal)
+            if mode == "ingress"
+            else build_worker_runtime(settings, stop_signal)
+        )
         logger.info(
-            "Calculation worker started",
+            "Calculation service process started",
             extra={
                 "service": settings.service_name,
+                "mode": mode,
                 "topic": settings.kafka_topic,
                 "group_id": settings.kafka_group_id,
                 "client_id": settings.kafka_client_id,
+                "executor_id": settings.dbos_executor_id if mode == "worker" else None,
+                "application_version": settings.dbos_application_version,
             },
         )
         runtime.run()
     except Exception:
         exit_code = 1
-        logger.exception("Calculation worker stopped after a technical failure")
+        logger.exception("Calculation service process stopped after a technical failure")
     finally:
         if runtime is not None and not runtime.close():
             exit_code = 1
-        logger.info("Calculation worker stopped", extra={"outcome": "shutdown"})
+        logger.info(
+            "Calculation service process stopped",
+            extra={"mode": mode, "outcome": "shutdown"},
+        )
         logging.shutdown()
     return exit_code
 
@@ -57,6 +76,13 @@ def _install_signal_handlers(stop_signal: Event) -> None:
 
     signal.signal(signal.SIGTERM, request_shutdown)
     signal.signal(signal.SIGINT, request_shutdown)
+
+
+def _parse_mode(argv: Sequence[str] | None) -> str:
+    parser = argparse.ArgumentParser(prog="calculation-worker")
+    parser.add_argument("mode", choices=("ingress", "worker"))
+    namespace = parser.parse_args(list(argv) if argv is not None else None)
+    return str(namespace.mode)
 
 
 if __name__ == "__main__":

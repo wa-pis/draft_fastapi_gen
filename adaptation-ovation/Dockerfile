@@ -2,7 +2,7 @@
 
 FROM ghcr.io/astral-sh/uv:0.11.23 AS uv
 
-FROM python:3.13 AS builder
+FROM python:3.12 AS builder
 
 ENV UV_COMPILE_BYTECODE=1 \
     UV_LINK_MODE=copy
@@ -16,7 +16,11 @@ RUN uv sync --locked --no-dev --group build --no-install-project
 COPY src ./src
 RUN make build
 
-FROM python:3.13-slim AS runtime
+FROM builder AS migrations
+
+ENTRYPOINT ["/app/.venv/bin/dbos", "migrate"]
+
+FROM python:3.12-slim AS runtime
 
 ENV HOME=/tmp \
     PYTHONDONTWRITEBYTECODE=1 \
@@ -34,4 +38,4 @@ COPY --from=builder --chown=worker:worker /app/dist/calculation-worker /app/calc
 USER worker
 VOLUME ["/tmp"]
 
-CMD ["/app/calculation-worker"]
+CMD ["/app/calculation-worker", "worker"]

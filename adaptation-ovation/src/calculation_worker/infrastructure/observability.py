@@ -30,6 +30,10 @@ _LOG_FIELDS = (
     "group_id",
     "client_id",
     "remaining_messages",
+    "workflow_id",
+    "executor_id",
+    "application_version",
+    "mode",
 )
 
 
@@ -75,7 +79,7 @@ class Metrics:
         )
         self.kafka_messages_invalid = Counter(
             "kafka_messages_invalid_total",
-            "Kafka messages sent to DLQ before handler routing",
+            "Invalid Kafka messages discarded after validation",
             registry=self.registry,
         )
         self.message_handler_calls = Counter(
@@ -117,11 +121,6 @@ class Metrics:
             "kafka_publish_total",
             "Kafka records acknowledged by the producer",
             ("topic", "outcome"),
-            registry=self.registry,
-        )
-        self.dlq_messages = Counter(
-            "dlq_messages_total",
-            "DLQ messages acknowledged by Kafka",
             registry=self.registry,
         )
         self.process_last_success_timestamp = Gauge(

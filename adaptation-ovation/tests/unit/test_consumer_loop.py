@@ -154,20 +154,19 @@ def test_publish_failure_inside_handler_does_not_commit() -> None:
     assert consumer.commits == []
 
 
-def test_failed_and_dlq_are_published_together_before_commit() -> None:
+def test_failed_event_is_published_before_commit() -> None:
     timeline: list[str] = []
     failed = _outgoing("failed")
-    dlq = _outgoing("dlq", topic="INTEGRATIONS.DLQ")
     loop, consumer, _processor, publisher = _loop(
         [_consumed(7)],
-        [HandlerResult(records=(failed, dlq), outcome="failed")],
+        [HandlerResult(records=(failed,), outcome="failed")],
         timeline,
     )
 
     loop.run()
 
-    assert publisher.batches == [(failed, dlq)]
-    assert timeline == ["publish:2", "commit:7"]
+    assert publisher.batches == [(failed,)]
+    assert timeline == ["publish:1", "commit:7"]
     assert len(consumer.commits) == 1
 
 
@@ -213,10 +212,7 @@ def test_three_messages_are_processed_and_committed_sequentially() -> None:
 
 def test_business_failure_does_not_prevent_processing_next_message() -> None:
     timeline: list[str] = []
-    failed_records = (
-        _outgoing("failed"),
-        _outgoing("dlq", topic="INTEGRATIONS.DLQ"),
-    )
+    failed_records = (_outgoing("failed"),)
     loop, consumer, _processor, publisher = _loop(
         [_consumed(1), _consumed(2)],
         [
@@ -347,5 +343,6 @@ def _settings() -> Settings:
         {
             "UPSTREAM_API_BASE_URL": "http://upstream.test",
             "UPSTREAM_API_TOKEN": "secret",
+            "DBOS_SYSTEM_DATABASE_URL": "postgresql://test:test@localhost/test",
         }
     )
