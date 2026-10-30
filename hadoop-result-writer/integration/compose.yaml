@@ -1,0 +1,11 @@
+name: hadoop-writer-integration
+services:
+  check:
+    build:
+      context: .
+    hostname: hadoop
+    init: true
+    mem_limit: 3g
+    tmpfs:
+      - /tmp:rw,nosuid,size=1536m
+    # Private, ephemeral single-node cluster. No host ports and no production credentials.

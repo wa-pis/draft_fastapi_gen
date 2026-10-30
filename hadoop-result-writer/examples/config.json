@@ -1,0 +1,13 @@
+{
+  "mode": "hdfs",
+  "principal": "writer@EXAMPLE.COM",
+  "keytab": "/run/secrets/writer.keytab",
+  "hdfs_root": "hdfs://nameservice1/apps/result-writer",
+  "refresh_seconds": 300,
+  "command_timeout": 120,
+  "target_file_bytes": 268435456,
+  "scratch_dir": "/tmp",
+  "cache_dir": "/tmp",
+  "readback_attempts": 5,
+  "readback_delay": 1
+}

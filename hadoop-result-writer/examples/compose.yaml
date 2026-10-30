@@ -1,0 +1,15 @@
+services:
+  writer:
+    image: hadoop-result-writer:prototype
+    build:
+      context: ..
+    read_only: true
+    init: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=768m,uid=10001,gid=10001,mode=0700
+    volumes:
+      - ${HRW_CONFIG:?Set HRW_CONFIG to an absolute JSON file}:/etc/writer/config.json:ro
+      - ${HRW_KEYTAB:?Set HRW_KEYTAB to an absolute keytab file}:/run/secrets/writer.keytab:ro
+      - ${HRW_KRB5_CONFIG:?Set HRW_KRB5_CONFIG to an absolute krb5.conf}:/etc/krb5.conf:ro
+      - ${HRW_HADOOP_CONF:?Set HRW_HADOOP_CONF to a Hadoop configuration directory}:/etc/hadoop:ro
+    command: ["diagnose", "--config", "/etc/writer/config.json"]

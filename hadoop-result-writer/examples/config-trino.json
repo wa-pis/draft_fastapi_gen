@@ -1,0 +1,15 @@
+{
+  "mode": "trino",
+  "principal": "writer@EXAMPLE.COM",
+  "keytab": "/run/secrets/writer.keytab",
+  "hdfs_root": "hdfs://nameservice1/apps/result-writer",
+  "trino_host": "trino.example.com",
+  "trino_port": 8443,
+  "trino_user": "writer",
+  "trino_service": "HTTP",
+  "catalog": "hive",
+  "schema": "writer_demo",
+  "table": "result",
+  "refresh_seconds": 300,
+  "command_timeout": 120
+}
