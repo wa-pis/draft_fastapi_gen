@@ -13,6 +13,7 @@ import shutil
 import subprocess
 import time
 from contextlib import suppress
+from decimal import Decimal
 from pathlib import Path
 from uuid import uuid4
 
@@ -23,6 +24,114 @@ ROW_BYTES = 4096
 CHUNK_BYTES = 64 * 1024
 GIB = 1024**3
 SEED = 20261108
+MONITOR_ERRORS = (asyncpg.PostgresError, asyncpg.InterfaceError, OSError)
+
+
+def activity_result() -> dict:
+    return {
+        "samples": 0,
+        "attempts": 0,
+        "timeouts": 0,
+        "errors": [],
+        "shutdown_timeout": False,
+        "close_error": None,
+        "coverage": "unavailable",
+        "backend_sample_histogram": {},
+        "interval_seconds": 0.5,
+    }
+
+
+def numeric_counters(record) -> dict:
+    result = {}
+    for key, value in dict(record).items():
+        if key == "datid" or isinstance(value, bool):
+            continue
+        if isinstance(value, Decimal):
+            value = int(value) if value == value.to_integral_value() else float(value)
+        if isinstance(value, (int, float)):
+            result[key] = value
+    return result
+
+
+def counter_deltas(before: dict, after: dict) -> dict:
+    return {
+        view: {
+            name: value - before[view][name]
+            for name, value in counters.items()
+            if name != "numbackends" and name in before.get(view, {})
+        }
+        for view, counters in after.items()
+        if view in before
+    }
+
+
+async def counter_snapshot(connection: asyncpg.Connection) -> dict:
+    version = int(await connection.fetchval("SHOW server_version_num"))
+    views = ["pg_stat_bgwriter", "pg_stat_wal"]
+    if version >= 170000:
+        views.append("pg_stat_checkpointer")
+    result = {}
+    for view in views:
+        result[view] = numeric_counters(await connection.fetchrow(f"SELECT * FROM {view}"))
+    result["pg_stat_database"] = numeric_counters(
+        await connection.fetchrow("SELECT * FROM pg_stat_database WHERE datname=current_database()")
+    )
+    return result
+
+
+async def sample_activity(connection: asyncpg.Connection, stop: asyncio.Event, result: dict):
+    while not stop.is_set():
+        result["attempts"] += 1
+        try:
+            rows = await connection.fetch(
+                "SELECT state, wait_event_type, wait_event, count(*) AS backends "
+                "FROM pg_stat_activity WHERE datname=current_database() "
+                "AND application_name='stream_writer_benchmark' "
+                "GROUP BY state, wait_event_type, wait_event"
+            )
+        except TimeoutError:
+            result["timeouts"] += 1
+        except MONITOR_ERRORS as exc:
+            result["errors"].append(type(exc).__name__)
+            break
+        else:
+            result["samples"] += 1
+            for row in rows:
+                key = " / ".join(
+                    row[name] or "none" for name in ("state", "wait_event_type", "wait_event")
+                )
+                result["backend_sample_histogram"][key] = (
+                    result["backend_sample_histogram"].get(key, 0) + row["backends"]
+                )
+        with suppress(TimeoutError):
+            await asyncio.wait_for(stop.wait(), timeout=0.5)
+
+
+async def stop_activity(task, connection, stop: asyncio.Event, result: dict):
+    stop.set()
+    try:
+        await asyncio.wait_for(task, timeout=6)
+    except TimeoutError:
+        result["shutdown_timeout"] = True
+    except MONITOR_ERRORS as exc:
+        result["errors"].append(type(exc).__name__)
+    finally:
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+        try:
+            await connection.close(timeout=5)
+        except (TimeoutError, *MONITOR_ERRORS) as exc:
+            result["close_error"] = type(exc).__name__
+            connection.terminate()
+        failed = (
+            result["timeouts"]
+            or result["errors"]
+            or result["shutdown_timeout"]
+            or result["close_error"]
+        )
+        result["coverage"] = (
+            "unavailable" if not result["samples"] else "partial" if failed else "complete"
+        )
 
 
 def row_bytes(number: int, generator: random.Random) -> bytes:
@@ -65,6 +174,20 @@ async def measure(args: argparse.Namespace, token: str, connection: asyncpg.Conn
     stop = asyncio.Event()
     low_disk = asyncio.Event()
     pg_pids = set()
+    diagnostics_enabled = getattr(args, "diagnostics", False)
+    diagnostics = {
+        "scope": "Client progress/activity during first PUT; client yields do not confirm commit",
+        "counter_scope": "pg_stat_database: current database; other views: whole cluster",
+        "counter_window": (
+            "Before activity monitor connect through shutdown and 1s collector settle; "
+            "may include background work and publication lag"
+        ),
+        "client_progress": [],
+        "activity": activity_result(),
+    }
+    upload_started = None
+    input_yield_finished = None
+    client_yield_wait_seconds = 0.0
 
     async def sample():
         nonlocal min_free
@@ -93,6 +216,7 @@ async def measure(args: argparse.Namespace, token: str, connection: asyncpg.Conn
             await asyncio.sleep(0.25)
 
     async def body(digest, label):
+        nonlocal input_yield_finished, client_yield_wait_seconds
         generator = random.Random(SEED)
         chunk = bytearray()
         for number in range(1, total_rows + 1):
@@ -101,13 +225,32 @@ async def measure(args: argparse.Namespace, token: str, connection: asyncpg.Conn
             chunk.extend(row_bytes(number, generator))
             if len(chunk) == CHUNK_BYTES:
                 digest.update(chunk)
+                yielded_at = time.monotonic() if diagnostics_enabled and label == "upload" else None
                 yield bytes(chunk)
+                if yielded_at is not None:
+                    client_yield_wait_seconds += time.monotonic() - yielded_at
                 chunk.clear()
             if number % (256 * 1024**2 // ROW_BYTES) == 0:
-                print(f"{label}: {number * ROW_BYTES / GIB:.2f}/{args.size_gib} GiB", flush=True)
+                message = f"{label}: {number * ROW_BYTES / GIB:.2f}/{args.size_gib} GiB"
+                if diagnostics_enabled and label == "upload":
+                    elapsed = time.monotonic() - upload_started
+                    diagnostics["client_progress"].append(
+                        {
+                            "input_bytes": number * ROW_BYTES,
+                            "elapsed_seconds": round(elapsed, 6),
+                            "client_yield_wait_seconds": round(client_yield_wait_seconds, 6),
+                        }
+                    )
+                    message += f"; client yield elapsed {elapsed:.3f}s"
+                print(message, flush=True)
         if chunk:
             digest.update(chunk)
+            yielded_at = time.monotonic() if diagnostics_enabled and label == "upload" else None
             yield bytes(chunk)
+            if yielded_at is not None:
+                client_yield_wait_seconds += time.monotonic() - yielded_at
+        if diagnostics_enabled and label == "upload":
+            input_yield_finished = time.monotonic()
 
     async def sizes():
         row = await connection.fetchrow(
@@ -131,6 +274,13 @@ async def measure(args: argparse.Namespace, token: str, connection: asyncpg.Conn
                 "checkpoint_timeout",
                 "wal_compression",
                 "data_checksums",
+                "checkpoint_completion_target",
+                "track_io_timing",
+                "track_wal_io_timing",
+                "wal_buffers",
+                "wal_sync_method",
+                "min_wal_size",
+                "default_toast_compression",
             ],
         )
     )
@@ -143,9 +293,59 @@ async def measure(args: argparse.Namespace, token: str, connection: asyncpg.Conn
             if not pg_pids:
                 raise RuntimeError("Set the API DSN application_name=stream_writer_benchmark")
             digest = hashlib.sha256()
+            monitor = None
+            activity_task = None
+            activity_stop = asyncio.Event()
+            if diagnostics_enabled:
+                diagnostics["counters_before"] = await counter_snapshot(connection)
+                try:
+                    monitor = await asyncpg.connect(
+                        os.environ["WRITER_TEST_DATABASE_URL"],
+                        server_settings={"application_name": "stream_load_activity_monitor"},
+                        command_timeout=5,
+                    )
+                except TimeoutError:
+                    diagnostics["activity"]["timeouts"] += 1
+                except MONITOR_ERRORS as exc:
+                    diagnostics["activity"]["errors"].append(type(exc).__name__)
+            # Прогон D исключён без «поправки» цифр: часы Python и PG разошлись.
+            # Сопоставление таймеров помогает заметить аномалию, но не доказывает её причину.
+            # Расхождение нужно учитывать при анализе отчёта; см. ../VALIDATION.md.
+            wall_started = time.time()
             started = time.monotonic()
-            response = await client.put(path, headers=headers, content=body(digest, "upload"))
-            upload_seconds = time.monotonic() - started
+            upload_started = started
+            if monitor is not None:
+                activity_task = asyncio.create_task(
+                    sample_activity(monitor, activity_stop, diagnostics["activity"])
+                )
+            try:
+                response = await client.put(path, headers=headers, content=body(digest, "upload"))
+            finally:
+                first_put_finished = time.monotonic()
+                wall_finished = time.time()
+                if activity_task is not None:
+                    await stop_activity(
+                        activity_task, monitor, activity_stop, diagnostics["activity"]
+                    )
+            upload_seconds = first_put_finished - started
+            if diagnostics_enabled:
+                diagnostics["wall_clock_upload_seconds"] = round(wall_finished - wall_started, 6)
+                diagnostics["wall_minus_monotonic_seconds"] = round(
+                    wall_finished - wall_started - upload_seconds, 6
+                )
+                # PG14's collector publishes counters asynchronously after the backend idles.
+                await asyncio.sleep(1)
+                diagnostics["counter_settle_seconds"] = 1
+                diagnostics["counters_after"] = await counter_snapshot(connection)
+                diagnostics["counter_deltas"] = counter_deltas(
+                    diagnostics["counters_before"], diagnostics["counters_after"]
+                )
+                diagnostics["final_tail_seconds"] = (
+                    round(first_put_finished - input_yield_finished, 6)
+                    if input_yield_finished is not None
+                    else None
+                )
+                diagnostics["client_yield_wait_seconds"] = round(client_yield_wait_seconds, 6)
             if response.status_code != 201:
                 raise RuntimeError(f"Upload failed: {response.status_code} {response.text}")
             receipt = response.json()
@@ -213,7 +413,7 @@ async def measure(args: argparse.Namespace, token: str, connection: asyncpg.Conn
         raise RuntimeError("Free disk fell below the benchmark reserve")
     if any(value <= 0 for value in peaks.values()):
         raise RuntimeError("A process memory measurement is missing")
-    return {
+    result = {
         "size_gib": args.size_gib,
         "row_bytes": ROW_BYTES,
         "seed": SEED,
@@ -239,6 +439,11 @@ async def measure(args: argparse.Namespace, token: str, connection: asyncpg.Conn
         "asyncpg_version": importlib.metadata.version("asyncpg"),
         "application_version": importlib.metadata.version("async-postgres-writer"),
     }
+    if diagnostics_enabled:
+        result["diagnostics"] = diagnostics
+    if getattr(args, "label", None) is not None:
+        result["label"] = args.label
+    return result
 
 
 def main():
@@ -250,6 +455,8 @@ def main():
     parser.add_argument("--server-pid", type=int, required=True)
     parser.add_argument("--disk-path", default="/private/tmp")
     parser.add_argument("--replay", action="store_true")
+    parser.add_argument("--diagnostics", action="store_true")
+    parser.add_argument("--label")
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args()
     result = asyncio.run(run(args))

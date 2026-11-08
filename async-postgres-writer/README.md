@@ -165,6 +165,24 @@ docker compose logs writer
 стенда. Для других окружений замените их и передавайте секреты штатным способом.
 Том PostgreSQL сохраняется после обычного `docker compose down`.
 
+Для загрузок 1–5 ГиБ есть отдельный профиль настроек PostgreSQL:
+
+```bash
+docker compose -f compose.yaml -f compose.bulk.yaml up --build -d writer
+```
+
+Он задаёт `max_wal_size=8GB` и `wal_buffers=16MB`. На локальном PostgreSQL 14 эти
+параметры уменьшили частоту checkpoint и число вынужденных записей WAL; сравнение
+и ограничения — в [VALIDATION.md](VALIDATION.md#оптимизация-потока-5-гиб).
+Сервис продолжает использовать одну транзакцию и `synchronous_commit=on`.
+Для внешней БД эти параметры настраивает её администратор: приложение их не меняет.
+`wal_buffers` требует перезапуска PostgreSQL. `max_wal_size` — мягкий предел:
+предусмотрите место под WAL, данные, индексы и удержание WAL репликами/архиватором;
+интервал между checkpoint может увеличить время восстановления после сбоя.
+Основание: [bulk COPY](https://www.postgresql.org/docs/14/populate.html#POPULATE-MAX-WAL-SIZE)
+и [настройки WAL](https://www.postgresql.org/docs/14/runtime-config-wal.html).
+Профиль Compose с PostgreSQL 17 требует проверки на вашем стенде.
+
 Контейнер работает от UID 10001. В образе установлено приложение из wheel с зависимостями
 по lock-файлу; PyInstaller не используется.
 

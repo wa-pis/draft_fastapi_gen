@@ -133,3 +133,39 @@ async def test_source_exception_is_not_reported_as_success():
 
     with pytest.raises(ConnectionError):
         _ = [item async for item in stream(disconnected())]
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        rb'{"value":"ASCII\u0000text"}',
+        rb'{"ASCII\u0000key":1}',
+        rb'{"value":"\ud800"}',
+        rb'{"value":"\udfff"}',
+        rb'{"\ud800":1}',
+        rb'{"\udfff":1}',
+        '{"value":"Привет\\u0000"}'.encode(),
+        b'{"value":"raw\tcontrol"}',
+    ],
+)
+async def test_jsonb_unsupported_strings_are_rejected_in_keys_and_values(payload):
+    with pytest.raises(WriterError) as error:
+        _ = [item async for item in stream(chunks(payload))]
+    assert error.value.status_code == 400
+    assert error.value.code == "invalid_stream"
+
+
+@pytest.mark.parametrize(
+    "payload,expected",
+    [
+        (b'{"key":"plain ASCII"}', {"key": "plain ASCII"}),
+        ('{"ключ":"Привет 😀"}'.encode(), {"ключ": "Привет 😀"}),
+        (rb'{"value":"\ud83d\ude00"}', {"value": "😀"}),
+        (rb'{"value":"line\n\t\u001f"}', {"value": "line\n\t\x1f"}),
+    ],
+)
+async def test_jsonb_supported_strings_keep_unicode_and_escaped_controls(payload, expected):
+    source = stream(chunks(payload))
+    assert [(number, json.loads(text)) async for number, text in source] == [(1, expected)]
+    assert source.sha256 == hashlib.sha256(payload).hexdigest()
+    assert source.byte_count == len(payload)

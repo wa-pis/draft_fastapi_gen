@@ -1,0 +1,20 @@
+# Замеры 2026-11-09: PostgreSQL 14/macOS, один HTTP-поток NDJSON, строки по 4 КиБ.
+# На 5 ГиБ наблюдались частые checkpoint и переполнения буфера WAL; RSS API ~70 МиБ.
+# max_wal_size 1 -> 8 ГиБ: 170,371 -> 133,426 с; requested checkpoint 11 -> 1.
+# wal_buffers 4 -> 16 МиБ: 133,426 -> 74,391 с; WAL writes 577 674 -> 149 019.
+# Вместе с ASCII fast path: 5 ГиБ за 64,762 с (79,059 МиБ/с),
+# 1 ГиБ за 13,973 с (73,282 МиБ/с). Вклад parser отдельно от разброса I/O не установлен.
+# Сохранены одна транзакция и fsync/full_page_writes/synchronous_commit=on;
+# проверены полное чтение с SHA-256, повтор без дубликатов и штатный перезапуск.
+# Это локальные одиночные замеры, не обещание скорости; PostgreSQL 17 в Compose не проверен.
+# max_wal_size — мягкий предел: нужен запас диска, crash recovery может стать дольше.
+# wal_buffers требует перезапуска PostgreSQL; внешнюю БД настраивает её администратор.
+# Полный протокол, исключённые замеры и исходные JSON: VALIDATION.md и benchmarks/results/.
+services:
+  postgres:
+    command:
+      - postgres
+      - -c
+      - max_wal_size=8GB
+      - -c
+      - wal_buffers=16MB
