@@ -1,0 +1,60 @@
+{
+  "size_gib": 5,
+  "row_bytes": 4096,
+  "seed": 20261108,
+  "receipt": {
+    "upload_id": "ba94adbc-4134-4770-9831-842c1c1249b0",
+    "sha256": "177492ad06f01baee54a913fa55987ebcdffe678ca8e4d206ce32da24f8e18bb",
+    "row_count": 1310720,
+    "byte_count": 5368709120,
+    "committed_at": "2026-11-08T19:50:30.239843+00:00",
+    "reused": false
+  },
+  "upload_seconds": 137.909,
+  "upload_mib_per_second": 37.126,
+  "readback_seconds": 24.009,
+  "readback_sha256": "177492ad06f01baee54a913fa55987ebcdffe678ca8e4d206ce32da24f8e18bb",
+  "readback_row_count": 1310720,
+  "replay_seconds": 29.654,
+  "replay_no_duplicates": true,
+  "sampled_peaks": {
+    "api_rss_bytes": 73138176,
+    "client_rss_bytes": 58671104,
+    "max_pg_backend_rss_bytes": 171786240
+  },
+  "sampling_interval_seconds": 0.5,
+  "memory_sampling_scope": "upload, readback and replay",
+  "disk_min_free_bytes": 75629355008,
+  "generated_wal_bytes": 6106896656,
+  "sizes_before": {
+    "database_bytes": 9061155,
+    "rows_relation_bytes": 16384,
+    "receipts_relation_bytes": 16384
+  },
+  "sizes_after": {
+    "database_bytes": 7411114787,
+    "rows_relation_bytes": 7402053632,
+    "receipts_relation_bytes": 32768
+  },
+  "postgres_settings": {
+    "block_size": "8192",
+    "checkpoint_timeout": "300",
+    "data_checksums": "off",
+    "fsync": "on",
+    "full_page_writes": "on",
+    "max_wal_size": "1024",
+    "shared_buffers": "16384",
+    "synchronous_commit": "on",
+    "wal_compression": "off"
+  },
+  "postgres_version": "PostgreSQL 14.20 (Homebrew) on aarch64-apple-darwin25.1.0, compiled by Apple clang version 17.0.0 (clang-1700.4.4.1), 64-bit",
+  "python_version": "3.13.14",
+  "platform": "macOS-26.6.2-arm64-arm-64bit-Mach-O",
+  "asyncpg_version": "0.31.0",
+  "application_version": "0.1.0",
+  "graceful_restart_receipt_and_row_count_verified": true,
+  "cpu": "Apple M4 Max",
+  "logical_cpus": 14,
+  "physical_ram_bytes": 38654705664,
+  "service_source_commit": "4c31eda5ddbb4d9a05834f132626b3b1a4d11510"
+}
