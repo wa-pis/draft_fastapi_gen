@@ -7,3 +7,7 @@ This repository contains a distributed AI platform built around FastAPI, Kafka, 
 - **Resilience & observability**: circuit breakers, retries, metrics, tracing, and structured logging are provided as shared patterns.
 
 See the `services` directory for individual bounded-context services and `scripts` for automation utilities (e.g. scaffolding).
+
+Standalone applications:
+
+- [Async PostgreSQL Writer](async-postgres-writer/README.md): HTTP NDJSON streaming into PostgreSQL with atomic COPY and upload receipts.
