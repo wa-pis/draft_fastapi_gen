@@ -25,5 +25,5 @@ asyncpg 0.31.0. PostgreSQL запущен во временном каталог
 
 Локальный Docker daemon и Compose недоступны, поэтому локальная сборка/запуск образа
 не выполнены. GitHub Actions проверяет PostgreSQL 17, wheel, сборку Docker и команду
-в образе; итог конкретного запуска смотрите в PR. Полный запуск Compose требует
+в образе; итог запуска смотрите в [PR #17](https://github.com/wa-pis/draft_fastapi_gen/pull/17). Полный запуск Compose требует
 отдельной проверки.
