@@ -1,0 +1,53 @@
+name: Async PostgreSQL Writer
+
+on:
+  pull_request:
+    paths:
+      - 'async-postgres-writer/**'
+      - '.github/workflows/async-postgres-writer.yml'
+  push:
+    branches: [main, 'codex/async-db-stream-writer']
+    paths:
+      - 'async-postgres-writer/**'
+      - '.github/workflows/async-postgres-writer.yml'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    defaults:
+      run:
+        working-directory: async-postgres-writer
+    services:
+      postgres:
+        image: postgres:17
+        env:
+          POSTGRES_USER: stream_test
+          POSTGRES_PASSWORD: stream_test
+          POSTGRES_DB: stream_test
+        ports: ['5432:5432']
+        options: >-
+          --health-cmd "pg_isready -U stream_test -d stream_test"
+          --health-interval 3s --health-timeout 3s --health-retries 20
+    env:
+      WRITER_TEST_DATABASE_URL: postgresql://stream_test:stream_test@localhost:5432/stream_test
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+        with:
+          version: '0.11.23'
+      - run: uv sync --locked --python 3.13
+      - run: uv run --locked ruff check .
+      - run: uv run --locked ruff format --check .
+      - run: uv run --locked pytest -q
+      - run: uv run --locked pytest -q -m integration
+      - run: uv build
+      - run: docker build -t async-postgres-writer:ci .
+      - run: docker run --rm async-postgres-writer:ci --help

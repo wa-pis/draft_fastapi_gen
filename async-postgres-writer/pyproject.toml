@@ -1,0 +1,43 @@
+[build-system]
+requires = ["hatchling>=1.27,<2"]
+build-backend = "hatchling.build"
+
+[project]
+name = "async-postgres-writer"
+version = "0.1.0"
+description = "Transactional NDJSON streaming ingestion into PostgreSQL"
+requires-python = ">=3.12"
+dependencies = [
+    "asyncpg>=0.31,<0.32",
+    "fastapi>=0.121,<1",
+    "pydantic-settings>=2.12,<3",
+    "uvicorn>=0.38,<1",
+]
+
+[project.scripts]
+async-postgres-writer = "async_postgres_writer.__main__:main"
+
+[dependency-groups]
+dev = [
+    "httpx>=0.28,<1",
+    "pytest>=8.4,<10",
+    "pytest-asyncio>=1.2,<2",
+    "ruff>=0.14,<1",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/async_postgres_writer"]
+
+[tool.pytest.ini_options]
+addopts = ["--strict-markers", "-m", "not integration"]
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
+testpaths = ["tests"]
+markers = ["integration: requires a dedicated PostgreSQL database"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E4", "E7", "E9", "F", "I", "UP", "B", "SIM", "RUF"]

@@ -1,0 +1,17 @@
+## 1. Design
+- [x] 1.1 Уточнить PostgreSQL и HTTP NDJSON как базу и входной транспорт.
+- [x] 1.2 Зафиксировать атомарный COPY, UUID, raw-byte SHA-256 и GET восстановления.
+
+## 2. Implementation
+- [x] 2.1 Добавить самостоятельный пакет, настройки и явный init схемы.
+- [x] 2.2 Реализовать bounded NDJSON parser, async COPY и транзакционный receipt.
+- [x] 2.3 Реализовать PUT/GET, авторизацию, health и управление пулом.
+- [x] 2.4 Добавить README, контейнер, Compose и команды проверки.
+
+## 3. Verification
+- [x] 3.1 Проверить unit/fault-сценарии parser, API и записи.
+- [x] 3.2 Проверить реальный PostgreSQL: commit, rollback, повтор, конфликт и конкуренцию.
+- [x] 3.3 Выполнить lint/format, сборку, CLI smoke и строгую валидацию OpenSpec.
+- [ ] 3.4 Проверить контейнер и поток 1–5 ГиБ; зафиксировать ограничения.
+
+Проверки и слияние в main отслеживаются в [PR #17](https://github.com/wa-pis/draft_fastapi_gen/pull/17).
