@@ -34,7 +34,7 @@ jobs:
           POSTGRES_DB: stream_test
         ports: ['5432:5432']
         options: >-
-          --health-cmd 'pg_isready -U stream_test -d stream_test'
+          --health-cmd "pg_isready -U stream_test -d stream_test"
           --health-interval 3s --health-timeout 3s --health-retries 20
     env:
       WRITER_TEST_DATABASE_URL: postgresql://stream_test:stream_test@localhost:5432/stream_test
