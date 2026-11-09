@@ -1,0 +1,353 @@
+{
+  "size_gib": 5,
+  "concurrency": 4,
+  "total_input_bytes": 21474836480,
+  "verified_total_rows": 5242880,
+  "row_bytes": 4096,
+  "seed": 20261108,
+  "upload_seconds": 124.837,
+  "upload_mib_per_second": 164.054,
+  "client_upload_cpu_seconds": 77.242,
+  "replay_no_duplicates": true,
+  "sampled_peaks": {
+    "client_rss_bytes": 58916864
+  },
+  "sampling_interval_seconds": 0.5,
+  "memory_sampling_scope": "client only: upload, readback and replay",
+  "disk_min_free_bytes": 21052100608,
+  "disk_reserve_bytes": 12884901888,
+  "generated_wal_bytes": 24542476592,
+  "sizes_before": {
+    "database_bytes": 7788211,
+    "rows_relation_bytes": 16384,
+    "receipts_relation_bytes": 16384
+  },
+  "sizes_after": {
+    "database_bytes": 29686683315,
+    "rows_relation_bytes": 29678895104,
+    "receipts_relation_bytes": 32768
+  },
+  "postgres_settings": {
+    "block_size": "8192",
+    "checkpoint_completion_target": "0.9",
+    "checkpoint_timeout": "300",
+    "data_checksums": "off",
+    "default_toast_compression": "pglz",
+    "fsync": "on",
+    "full_page_writes": "on",
+    "max_wal_size": "8192",
+    "min_wal_size": "80",
+    "shared_buffers": "16384",
+    "synchronous_commit": "on",
+    "track_io_timing": "on",
+    "track_wal_io_timing": "on",
+    "wal_buffers": "2048",
+    "wal_compression": "off",
+    "wal_sync_method": "fdatasync"
+  },
+  "postgres_version": "PostgreSQL 17.11 (Debian 17.11-1.pgdg13+2) on aarch64-unknown-linux-gnu, compiled by gcc (Debian 14.2.0-19) 14.2.0, 64-bit",
+  "python_version": "3.13.14",
+  "platform": "macOS-26.6.2-arm64-arm-64bit-Mach-O",
+  "asyncpg_version": "0.31.0",
+  "application_version": "0.1.0",
+  "uploads": [
+    {
+      "receipt": {
+        "upload_id": "eb4336ab-1c0b-435e-af2d-aa70e7f20895",
+        "sha256": "177492ad06f01baee54a913fa55987ebcdffe678ca8e4d206ce32da24f8e18bb",
+        "row_count": 1310720,
+        "byte_count": 5368709120,
+        "committed_at": "2026-11-09T19:36:44.889718+00:00",
+        "reused": false
+      },
+      "upload_seconds": 124.837,
+      "upload_mib_per_second": 41.014,
+      "readback_seconds": 99.771,
+      "readback_sha256": "177492ad06f01baee54a913fa55987ebcdffe678ca8e4d206ce32da24f8e18bb",
+      "readback_row_count": 1310720,
+      "replay_seconds": 21.044,
+      "replay_no_duplicates": true
+    },
+    {
+      "receipt": {
+        "upload_id": "90451dc3-14af-44cc-bb4b-69d5841deb27",
+        "sha256": "177492ad06f01baee54a913fa55987ebcdffe678ca8e4d206ce32da24f8e18bb",
+        "row_count": 1310720,
+        "byte_count": 5368709120,
+        "committed_at": "2026-11-09T19:36:44.880270+00:00",
+        "reused": false
+      },
+      "upload_seconds": 124.827,
+      "upload_mib_per_second": 41.017,
+      "readback_seconds": 84.459,
+      "readback_sha256": "177492ad06f01baee54a913fa55987ebcdffe678ca8e4d206ce32da24f8e18bb",
+      "readback_row_count": 1310720,
+      "replay_seconds": 20.766,
+      "replay_no_duplicates": true
+    },
+    {
+      "receipt": {
+        "upload_id": "3d0c9151-8f96-40b3-a964-c538f621d053",
+        "sha256": "177492ad06f01baee54a913fa55987ebcdffe678ca8e4d206ce32da24f8e18bb",
+        "row_count": 1310720,
+        "byte_count": 5368709120,
+        "committed_at": "2026-11-09T19:36:44.868620+00:00",
+        "reused": false
+      },
+      "upload_seconds": 124.815,
+      "upload_mib_per_second": 41.021,
+      "readback_seconds": 85.105,
+      "readback_sha256": "177492ad06f01baee54a913fa55987ebcdffe678ca8e4d206ce32da24f8e18bb",
+      "readback_row_count": 1310720,
+      "replay_seconds": 20.697,
+      "replay_no_duplicates": true
+    },
+    {
+      "receipt": {
+        "upload_id": "f9dc313b-6603-4f7d-84c7-f597da90cbd4",
+        "sha256": "177492ad06f01baee54a913fa55987ebcdffe678ca8e4d206ce32da24f8e18bb",
+        "row_count": 1310720,
+        "byte_count": 5368709120,
+        "committed_at": "2026-11-09T19:36:44.836960+00:00",
+        "reused": false
+      },
+      "upload_seconds": 124.785,
+      "upload_mib_per_second": 41.03,
+      "readback_seconds": 85.184,
+      "readback_sha256": "177492ad06f01baee54a913fa55987ebcdffe678ca8e4d206ce32da24f8e18bb",
+      "readback_row_count": 1310720,
+      "replay_seconds": 20.445,
+      "replay_no_duplicates": true
+    }
+  ],
+  "diagnostics": {
+    "scope": "Activity during concurrent PUTs; no per-stream client yield timing",
+    "counter_scope": "pg_stat_database: current database; other views: whole cluster",
+    "counter_window": "Before activity monitor connect through shutdown and 1s collector settle; may include background work and publication lag",
+    "activity": {
+      "samples": 247,
+      "attempts": 247,
+      "timeouts": 0,
+      "errors": [],
+      "shutdown_timeout": false,
+      "close_error": null,
+      "coverage": "complete",
+      "backend_sample_histogram": {
+        "active / Client / ClientRead": 1,
+        "idle / Client / ClientRead": 1,
+        "active / LWLock / BufferContent": 154,
+        "active / LWLock / WALWrite": 219,
+        "active / none / none": 242,
+        "active / Lock / extend": 219,
+        "active / IO / WalInitSync": 13,
+        "active / IO / DataFileExtend": 33,
+        "active / LWLock / LockManager": 27,
+        "active / IO / DataFileWrite": 33,
+        "active / IO / WalWrite": 8,
+        "active / Timeout / SpinDelay": 2,
+        "active / IO / WalInitWrite": 4,
+        "active / IO / WalSync": 22,
+        "active / LWLock / WALBufMapping": 3,
+        "active / LWLock / WALInsert": 2,
+        "active / IO / DataFileRead": 3
+      },
+      "active_copy_backend_histogram": {
+        "1": 1,
+        "4": 246
+      },
+      "peak_active_copy_backends": 4,
+      "interval_seconds": 0.5
+    },
+    "counters_before": {
+      "pg_stat_bgwriter": {
+        "buffers_clean": 0,
+        "maxwritten_clean": 0,
+        "buffers_alloc": 256
+      },
+      "pg_stat_wal": {
+        "wal_records": 25369,
+        "wal_fpi": 1464,
+        "wal_bytes": 9711886,
+        "wal_buffers_full": 0,
+        "wal_write": 753,
+        "wal_sync": 7,
+        "wal_write_time": 0.025,
+        "wal_sync_time": 0.608
+      },
+      "pg_stat_checkpointer": {
+        "num_timed": 0,
+        "num_requested": 2,
+        "restartpoints_timed": 0,
+        "restartpoints_req": 0,
+        "restartpoints_done": 0,
+        "write_time": 8.0,
+        "sync_time": 15.0,
+        "buffers_written": 980
+      },
+      "pg_stat_database": {
+        "numbackends": 2,
+        "xact_commit": 20,
+        "xact_rollback": 0,
+        "blks_read": 234,
+        "blks_hit": 3661,
+        "tup_returned": 1818,
+        "tup_fetched": 1721,
+        "tup_inserted": 110,
+        "tup_updated": 7,
+        "tup_deleted": 0,
+        "conflicts": 0,
+        "temp_files": 0,
+        "temp_bytes": 0,
+        "deadlocks": 0,
+        "blk_read_time": 0.133,
+        "blk_write_time": 0.0,
+        "session_time": 13912.413,
+        "active_time": 11.303,
+        "idle_in_transaction_time": 2.844,
+        "sessions": 9,
+        "sessions_abandoned": 0,
+        "sessions_fatal": 0,
+        "sessions_killed": 0
+      }
+    },
+    "wall_clock_upload_seconds": 124.837297,
+    "wall_minus_monotonic_seconds": 0.000691,
+    "counter_settle_seconds": 1,
+    "counters_after": {
+      "pg_stat_bgwriter": {
+        "buffers_clean": 59800,
+        "maxwritten_clean": 598,
+        "buffers_alloc": 3665720
+      },
+      "pg_stat_wal": {
+        "wal_records": 36865642,
+        "wal_fpi": 1653,
+        "wal_bytes": 24463604515,
+        "wal_buffers_full": 1563446,
+        "wal_write": 1565613,
+        "wal_sync": 2064,
+        "wal_write_time": 7866.674,
+        "wal_sync_time": 16082.505
+      },
+      "pg_stat_checkpointer": {
+        "num_timed": 0,
+        "num_requested": 7,
+        "restartpoints_timed": 0,
+        "restartpoints_req": 0,
+        "restartpoints_done": 0,
+        "write_time": 79101.0,
+        "sync_time": 952.0,
+        "buffers_written": 1311
+      },
+      "pg_stat_database": {
+        "numbackends": 5,
+        "xact_commit": 336,
+        "xact_rollback": 0,
+        "blks_read": 57831,
+        "blks_hit": 102809703,
+        "tup_returned": 5250279,
+        "tup_fetched": 5247689,
+        "tup_inserted": 20971634,
+        "tup_updated": 11,
+        "tup_deleted": 0,
+        "conflicts": 0,
+        "temp_files": 0,
+        "temp_bytes": 0,
+        "deadlocks": 0,
+        "blk_read_time": 1070.516,
+        "blk_write_time": 42171.971,
+        "session_time": 648241.259,
+        "active_time": 499276.799,
+        "idle_in_transaction_time": 39.835,
+        "sessions": 55,
+        "sessions_abandoned": 0,
+        "sessions_fatal": 0,
+        "sessions_killed": 0
+      }
+    },
+    "counter_deltas": {
+      "pg_stat_bgwriter": {
+        "buffers_clean": 59800,
+        "maxwritten_clean": 598,
+        "buffers_alloc": 3665464
+      },
+      "pg_stat_wal": {
+        "wal_records": 36840273,
+        "wal_fpi": 189,
+        "wal_bytes": 24453892629,
+        "wal_buffers_full": 1563446,
+        "wal_write": 1564860,
+        "wal_sync": 2057,
+        "wal_write_time": 7866.649,
+        "wal_sync_time": 16081.896999999999
+      },
+      "pg_stat_checkpointer": {
+        "num_timed": 0,
+        "num_requested": 5,
+        "restartpoints_timed": 0,
+        "restartpoints_req": 0,
+        "restartpoints_done": 0,
+        "write_time": 79093.0,
+        "sync_time": 937.0,
+        "buffers_written": 331
+      },
+      "pg_stat_database": {
+        "xact_commit": 316,
+        "xact_rollback": 0,
+        "blks_read": 57597,
+        "blks_hit": 102806042,
+        "tup_returned": 5248461,
+        "tup_fetched": 5245968,
+        "tup_inserted": 20971524,
+        "tup_updated": 4,
+        "tup_deleted": 0,
+        "conflicts": 0,
+        "temp_files": 0,
+        "temp_bytes": 0,
+        "deadlocks": 0,
+        "blk_read_time": 1070.383,
+        "blk_write_time": 42171.971,
+        "session_time": 634328.8459999999,
+        "active_time": 499265.496,
+        "idle_in_transaction_time": 36.991,
+        "sessions": 46,
+        "sessions_abandoned": 0,
+        "sessions_fatal": 0,
+        "sessions_killed": 0
+      }
+    }
+  },
+  "label": "compose-pg17-4x5gib",
+  "graceful_restart_receipts_and_row_counts_verified": true,
+  "compose_images": {
+    "writer": {
+      "image_id": "sha256:4a50117b0803518686cc380aefe347af6dbc6db0a648e45915ee1f5da438f319",
+      "repo_digests": [
+        "async-postgres-writer@sha256:4a50117b0803518686cc380aefe347af6dbc6db0a648e45915ee1f5da438f319"
+      ]
+    },
+    "postgres": {
+      "image_id": "sha256:ff87138949ad9a46f32ff23bd6852b52ce024a13dffe9b4087be98292cdd3b4f",
+      "repo_digests": [
+        "postgres@sha256:ff87138949ad9a46f32ff23bd6852b52ce024a13dffe9b4087be98292cdd3b4f"
+      ]
+    }
+  },
+  "service_python_version": "Python 3.13.18",
+  "writer_pool_size": 4,
+  "vm_cpu_count": 6,
+  "vm_memory_gib": 8,
+  "vm_disk_gib": 85,
+  "vm_disk_reserve_gib": 20,
+  "vm_disk_min_free_bytes": 45274517504,
+  "wal_directory_peak_bytes": 8589934592,
+  "host_disk_preflight_free_bytes": 60060479488,
+  "fresh_compose_project": true,
+  "pre_upload_checkpoint": true,
+  "same_payload_as_single_upload": true,
+  "source_commit": "4b572fa4720fa15052f8da3669a468bac9eb8170",
+  "benchmark_script_sha256": "11ffae536b646c3d6f79e2d1c829902d74988bec36c8384776930a307ae6f673",
+  "environment": "Colima 0.9.1, VZ Linux ARM64; macOS client",
+  "docker_engine_version": "28.4.0",
+  "docker_compose_version": "5.7.0"
+}

@@ -37,6 +37,8 @@ def activity_result() -> dict:
         "close_error": None,
         "coverage": "unavailable",
         "backend_sample_histogram": {},
+        "active_copy_backend_histogram": {},
+        "peak_active_copy_backends": 0,
         "interval_seconds": 0.5,
     }
 
@@ -79,15 +81,19 @@ async def counter_snapshot(connection: asyncpg.Connection) -> dict:
     return result
 
 
-async def sample_activity(connection: asyncpg.Connection, stop: asyncio.Event, result: dict):
+async def sample_activity(
+    connection: asyncpg.Connection, stop: asyncio.Event, result: dict, pg_pids=None
+):
     while not stop.is_set():
         result["attempts"] += 1
         try:
             rows = await connection.fetch(
-                "SELECT state, wait_event_type, wait_event, count(*) AS backends "
-                "FROM pg_stat_activity WHERE datname=current_database() "
-                "AND application_name='stream_writer_benchmark' "
-                "GROUP BY state, wait_event_type, wait_event"
+                "SELECT a.state, a.wait_event_type, a.wait_event, count(*) AS backends, "
+                "count(c.pid) AS active_copies, array_agg(a.pid) AS pids "
+                "FROM pg_stat_activity AS a LEFT JOIN pg_stat_progress_copy AS c USING (pid) "
+                "WHERE a.datname=current_database() "
+                "AND a.application_name='stream_writer_benchmark' "
+                "GROUP BY a.state, a.wait_event_type, a.wait_event"
             )
         except TimeoutError:
             result["timeouts"] += 1
@@ -96,7 +102,13 @@ async def sample_activity(connection: asyncpg.Connection, stop: asyncio.Event, r
             break
         else:
             result["samples"] += 1
+            copies = sum(row.get("active_copies", 0) for row in rows)
+            copy_histogram = result["active_copy_backend_histogram"]
+            copy_histogram[str(copies)] = copy_histogram.get(str(copies), 0) + 1
+            result["peak_active_copy_backends"] = max(result["peak_active_copy_backends"], copies)
             for row in rows:
+                if pg_pids is not None:
+                    pg_pids.update(row["pids"])
                 key = " / ".join(
                     row[name] or "none" for name in ("state", "wait_event_type", "wait_event")
                 )
@@ -148,6 +160,50 @@ def rss_bytes(pid: int) -> int:
     return int(result.stdout.strip() or 0) * 1024
 
 
+def stream_label(phase: str, index: int, concurrency: int) -> str:
+    return phase if concurrency == 1 else f"{phase} {index + 1}/{concurrency}"
+
+
+async def upload_batch(client, headers, upload_ids, body, total_bytes, total_rows):
+    async def put(index, upload_id):
+        digest = hashlib.sha256()
+        label = stream_label("upload", index, len(upload_ids))
+        started = time.monotonic()
+        response = await client.put(
+            f"/v1/uploads/{upload_id}", headers=headers, content=body(digest, label)
+        )
+        finished = time.monotonic()
+        wall_finished = time.time()
+        if response.status_code != 201:
+            raise RuntimeError(f"{label} failed: {response.status_code} {response.text}")
+        receipt = response.json()
+        assert receipt["upload_id"] == str(upload_id)
+        assert receipt["byte_count"] == total_bytes
+        assert receipt["row_count"] == total_rows
+        assert receipt["sha256"] == digest.hexdigest()
+        assert receipt["reused"] is False
+        elapsed = finished - started
+        return (
+            {
+                "receipt": receipt,
+                "upload_seconds": round(elapsed, 3),
+                "upload_mib_per_second": round(total_bytes / 1024**2 / elapsed, 3),
+            },
+            finished,
+            wall_finished,
+        )
+
+    if len(upload_ids) == 1:
+        results = [await put(0, upload_ids[0])]
+    else:
+        # Schedule every PUT before yielding to any of them; a failure cancels its peers.
+        async with asyncio.TaskGroup() as group:
+            tasks = [group.create_task(put(index, key)) for index, key in enumerate(upload_ids)]
+        results = [task.result() for task in tasks]
+    _, finished, wall_finished = max(results, key=lambda result: result[1])
+    return [result[0] for result in results], finished, wall_finished
+
+
 async def run(args: argparse.Namespace) -> dict:
     token = os.environ["WRITER_API_TOKEN"]
     connection = await asyncpg.connect(
@@ -166,28 +222,35 @@ async def run(args: argparse.Namespace) -> dict:
 async def measure(args: argparse.Namespace, token: str, connection: asyncpg.Connection) -> dict:
     total_bytes = args.size_gib * GIB
     total_rows = total_bytes // ROW_BYTES
-    upload_id = uuid4()
+    concurrency = getattr(args, "concurrency", 1)
+    upload_ids = [uuid4() for _ in range(concurrency)]
     headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/x-ndjson"}
-    path = f"/v1/uploads/{upload_id}"
     server_rss = args.server_pid is not None
     peaks = {"client_rss_bytes": 0}
     if server_rss:
         peaks.update(api_rss_bytes=0, max_pg_backend_rss_bytes=0)
+    min_disk_free_gib = getattr(args, "min_disk_free_gib", 20)
+    disk_reserve_bytes = min_disk_free_gib * GIB
     min_free = shutil.disk_usage(args.disk_path).free
     stop = asyncio.Event()
     low_disk = asyncio.Event()
     pg_pids = set()
     diagnostics_enabled = getattr(args, "diagnostics", False)
     diagnostics = {
-        "scope": "Client progress/activity during first PUT; client yields do not confirm commit",
+        "scope": (
+            "Client progress/activity during first PUT; client yields do not confirm commit"
+            if concurrency == 1
+            else "Activity during concurrent PUTs; no per-stream client yield timing"
+        ),
         "counter_scope": "pg_stat_database: current database; other views: whole cluster",
         "counter_window": (
             "Before activity monitor connect through shutdown and 1s collector settle; "
             "may include background work and publication lag"
         ),
-        "client_progress": [],
         "activity": activity_result(),
     }
+    if concurrency == 1:
+        diagnostics["client_progress"] = []
     upload_started = None
     input_yield_finished = None
     client_yield_wait_seconds = 0.0
@@ -203,7 +266,7 @@ async def measure(args: argparse.Namespace, token: str, connection: asyncpg.Conn
                         peaks["max_pg_backend_rss_bytes"], rss_bytes(pid)
                     )
             min_free = min(min_free, shutil.disk_usage(args.disk_path).free)
-            if min_free < 20 * GIB:
+            if min_free < disk_reserve_bytes:
                 low_disk.set()
             with suppress(TimeoutError):
                 await asyncio.wait_for(stop.wait(), timeout=0.5)
@@ -225,7 +288,9 @@ async def measure(args: argparse.Namespace, token: str, connection: asyncpg.Conn
         chunk = bytearray()
         for number in range(1, total_rows + 1):
             if low_disk.is_set():
-                raise RuntimeError("Benchmark aborted: free disk fell below 20 GiB")
+                raise RuntimeError(
+                    f"Benchmark aborted: free disk fell below {min_disk_free_gib} GiB"
+                )
             chunk.extend(row_bytes(number, generator))
             if len(chunk) == CHUNK_BYTES:
                 digest.update(chunk)
@@ -296,12 +361,12 @@ async def measure(args: argparse.Namespace, token: str, connection: asyncpg.Conn
             await discover_backends()
             if not pg_pids:
                 raise RuntimeError("Set the API DSN application_name=stream_writer_benchmark")
-            digest = hashlib.sha256()
             monitor = None
             activity_task = None
             activity_stop = asyncio.Event()
             if diagnostics_enabled:
                 diagnostics["counters_before"] = await counter_snapshot(connection)
+            if diagnostics_enabled or (server_rss and concurrency > 1):
                 try:
                     monitor = await asyncpg.connect(
                         os.environ["WRITER_TEST_DATABASE_URL"],
@@ -317,21 +382,28 @@ async def measure(args: argparse.Namespace, token: str, connection: asyncpg.Conn
             # Расхождение нужно учитывать при анализе отчёта; см. ../VALIDATION.md.
             wall_started = time.time()
             started = time.monotonic()
+            client_cpu_started = time.process_time()
             upload_started = started
             if monitor is not None:
                 activity_task = asyncio.create_task(
-                    sample_activity(monitor, activity_stop, diagnostics["activity"])
+                    sample_activity(
+                        monitor,
+                        activity_stop,
+                        diagnostics["activity"],
+                        pg_pids if server_rss else None,
+                    )
                 )
             try:
-                response = await client.put(path, headers=headers, content=body(digest, "upload"))
+                uploads, upload_finished, wall_finished = await upload_batch(
+                    client, headers, upload_ids, body, total_bytes, total_rows
+                )
+                client_upload_cpu_seconds = time.process_time() - client_cpu_started
             finally:
-                first_put_finished = time.monotonic()
-                wall_finished = time.time()
                 if activity_task is not None:
                     await stop_activity(
                         activity_task, monitor, activity_stop, diagnostics["activity"]
                     )
-            upload_seconds = first_put_finished - started
+            upload_seconds = upload_finished - started
             if diagnostics_enabled:
                 diagnostics["wall_clock_upload_seconds"] = round(wall_finished - wall_started, 6)
                 diagnostics["wall_minus_monotonic_seconds"] = round(
@@ -344,72 +416,85 @@ async def measure(args: argparse.Namespace, token: str, connection: asyncpg.Conn
                 diagnostics["counter_deltas"] = counter_deltas(
                     diagnostics["counters_before"], diagnostics["counters_after"]
                 )
-                diagnostics["final_tail_seconds"] = (
-                    round(first_put_finished - input_yield_finished, 6)
-                    if input_yield_finished is not None
-                    else None
-                )
-                diagnostics["client_yield_wait_seconds"] = round(client_yield_wait_seconds, 6)
-            if response.status_code != 201:
-                raise RuntimeError(f"Upload failed: {response.status_code} {response.text}")
-            receipt = response.json()
-            assert receipt["upload_id"] == str(upload_id)
-            assert receipt["byte_count"] == total_bytes
-            assert receipt["row_count"] == total_rows
-            assert receipt["sha256"] == digest.hexdigest()
-            assert receipt["reused"] is False
-            assert (await client.get(path, headers=headers)).json() == receipt
+                if concurrency == 1:
+                    diagnostics["final_tail_seconds"] = (
+                        round(upload_finished - input_yield_finished, 6)
+                        if input_yield_finished is not None
+                        else None
+                    )
+                    diagnostics["client_yield_wait_seconds"] = round(client_yield_wait_seconds, 6)
+            for upload_id, upload in zip(upload_ids, uploads, strict=True):
+                response = await client.get(f"/v1/uploads/{upload_id}", headers=headers)
+                assert response.status_code == 200
+                assert response.json() == upload["receipt"]
             lsn_after = await connection.fetchval("SELECT pg_current_wal_insert_lsn()")
             wal_bytes = await connection.fetchval(
                 "SELECT pg_wal_lsn_diff($1::pg_lsn, $2::pg_lsn)", lsn_after, lsn_before
             )
             after = await sizes()
-            stored_digest = hashlib.sha256()
-            stored_rows = 0
-            read_started = time.monotonic()
-            async with connection.transaction(readonly=True):
-                async for row in connection.cursor(
-                    "SELECT row_number, data FROM stream_writer.rows "
-                    "WHERE upload_id=$1 ORDER BY row_number",
-                    upload_id,
-                    prefetch=256,
-                ):
-                    stored_rows += 1
-                    data = json.loads(row["data"])
-                    assert set(data) == {"n", "payload"}
-                    assert row["row_number"] == stored_rows == data["n"]
-                    encoded = (
-                        json.dumps(
-                            {"n": data["n"], "payload": data["payload"]}, separators=(",", ":")
-                        ).encode()
-                        + b"\n"
-                    )
-                    assert len(encoded) == ROW_BYTES
-                    stored_digest.update(encoded)
-                    if stored_rows % (256 * 1024**2 // ROW_BYTES) == 0:
-                        print(
-                            f"readback: {stored_rows * ROW_BYTES / GIB:.2f}/{args.size_gib} GiB",
-                            flush=True,
+            for index, (upload_id, upload) in enumerate(zip(upload_ids, uploads, strict=True)):
+                receipt = upload["receipt"]
+                stored_digest = hashlib.sha256()
+                stored_rows = 0
+                read_started = time.monotonic()
+                read_label = stream_label("readback", index, concurrency)
+                async with connection.transaction(readonly=True):
+                    async for row in connection.cursor(
+                        "SELECT row_number, data FROM stream_writer.rows "
+                        "WHERE upload_id=$1 ORDER BY row_number",
+                        upload_id,
+                        prefetch=256,
+                    ):
+                        stored_rows += 1
+                        data = json.loads(row["data"])
+                        assert set(data) == {"n", "payload"}
+                        assert row["row_number"] == stored_rows == data["n"]
+                        encoded = (
+                            json.dumps(
+                                {"n": data["n"], "payload": data["payload"]}, separators=(",", ":")
+                            ).encode()
+                            + b"\n"
                         )
-            read_seconds = time.monotonic() - read_started
-            assert stored_rows == total_rows and stored_digest.hexdigest() == receipt["sha256"]
-            replay_seconds = None
-            if args.replay:
-                replay_digest = hashlib.sha256()
-                started = time.monotonic()
-                repeated = await client.put(
-                    path, headers=headers, content=body(replay_digest, "replay")
-                )
-                replay_seconds = time.monotonic() - started
-                assert repeated.status_code == 200, repeated.text
-                assert repeated.json() == dict(receipt, reused=True)
-                assert replay_digest.hexdigest() == receipt["sha256"]
-                assert (
-                    await connection.fetchval(
-                        "SELECT count(*) FROM stream_writer.rows WHERE upload_id=$1", upload_id
+                        assert len(encoded) == ROW_BYTES
+                        stored_digest.update(encoded)
+                        if stored_rows % (256 * 1024**2 // ROW_BYTES) == 0:
+                            print(
+                                f"{read_label}: {stored_rows * ROW_BYTES / GIB:.2f}/{args.size_gib} GiB",
+                                flush=True,
+                            )
+                read_seconds = time.monotonic() - read_started
+                assert stored_rows == total_rows and stored_digest.hexdigest() == receipt["sha256"]
+                replay_seconds = None
+                if args.replay:
+                    replay_digest = hashlib.sha256()
+                    replay_started = time.monotonic()
+                    repeated = await client.put(
+                        f"/v1/uploads/{upload_id}",
+                        headers=headers,
+                        content=body(replay_digest, stream_label("replay", index, concurrency)),
                     )
-                    == total_rows
+                    replay_seconds = time.monotonic() - replay_started
+                    assert repeated.status_code == 200, repeated.text
+                    assert repeated.json() == dict(receipt, reused=True)
+                    assert replay_digest.hexdigest() == receipt["sha256"]
+                    assert (
+                        await connection.fetchval(
+                            "SELECT count(*) FROM stream_writer.rows WHERE upload_id=$1", upload_id
+                        )
+                        == total_rows
+                    )
+                upload.update(
+                    readback_seconds=round(read_seconds, 3),
+                    readback_sha256=stored_digest.hexdigest(),
+                    readback_row_count=stored_rows,
+                    replay_seconds=round(replay_seconds, 3) if replay_seconds is not None else None,
+                    replay_no_duplicates=args.replay,
                 )
+            counts = await connection.fetchrow(
+                "SELECT (SELECT count(*) FROM stream_writer.rows) AS rows, "
+                "(SELECT count(*) FROM stream_writer.uploads) AS uploads"
+            )
+            assert counts["rows"] == total_rows * concurrency and counts["uploads"] == concurrency
     finally:
         stop.set()
         await sampler
@@ -419,15 +504,14 @@ async def measure(args: argparse.Namespace, token: str, connection: asyncpg.Conn
         raise RuntimeError("A process memory measurement is missing")
     result = {
         "size_gib": args.size_gib,
+        "concurrency": concurrency,
+        "total_input_bytes": total_bytes * concurrency,
+        "verified_total_rows": counts["rows"],
         "row_bytes": ROW_BYTES,
         "seed": SEED,
-        "receipt": receipt,
         "upload_seconds": round(upload_seconds, 3),
-        "upload_mib_per_second": round(total_bytes / 1024**2 / upload_seconds, 3),
-        "readback_seconds": round(read_seconds, 3),
-        "readback_sha256": stored_digest.hexdigest(),
-        "readback_row_count": stored_rows,
-        "replay_seconds": round(replay_seconds, 3) if replay_seconds is not None else None,
+        "upload_mib_per_second": round(total_bytes * concurrency / 1024**2 / upload_seconds, 3),
+        "client_upload_cpu_seconds": round(client_upload_cpu_seconds, 3),
         "replay_no_duplicates": args.replay,
         "sampled_peaks": peaks,
         "sampling_interval_seconds": 0.5,
@@ -437,6 +521,7 @@ async def measure(args: argparse.Namespace, token: str, connection: asyncpg.Conn
             else "client only: upload, readback and replay"
         ),
         "disk_min_free_bytes": min_free,
+        "disk_reserve_bytes": disk_reserve_bytes,
         "generated_wal_bytes": int(wal_bytes),
         "sizes_before": before,
         "sizes_after": after,
@@ -447,6 +532,10 @@ async def measure(args: argparse.Namespace, token: str, connection: asyncpg.Conn
         "asyncpg_version": importlib.metadata.version("asyncpg"),
         "application_version": importlib.metadata.version("async-postgres-writer"),
     }
+    if concurrency == 1:
+        result.update({key: value for key, value in uploads[0].items() if key not in result})
+    else:
+        result["uploads"] = uploads
     if diagnostics_enabled:
         result["diagnostics"] = diagnostics
     if getattr(args, "label", None) is not None:
@@ -460,17 +549,21 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--url", default="http://127.0.0.1:8080")
     parser.add_argument("--size-gib", type=int, choices=(1, 5), required=True)
+    parser.add_argument("--concurrency", type=int, choices=(1, 2, 4), default=1)
     parser.add_argument(
         "--server-pid",
         type=int,
         help="Sample API and PostgreSQL RSS only when their PIDs are visible to the client",
     )
     parser.add_argument("--disk-path", default="/private/tmp")
+    parser.add_argument("--min-disk-free-gib", type=int, default=20)
     parser.add_argument("--replay", action="store_true")
     parser.add_argument("--diagnostics", action="store_true")
     parser.add_argument("--label")
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args()
+    if args.min_disk_free_gib < 1:
+        parser.error("--min-disk-free-gib must be at least 1")
     result = asyncio.run(run(args))
     args.output.write_text(json.dumps(result, indent=2) + "\n")
     print(json.dumps(result, indent=2), flush=True)
