@@ -39,7 +39,10 @@ def _validate(line: bytes) -> str:
                 pending.extend(item.values())
             elif isinstance(item, list):
                 pending.extend(item)
-            elif isinstance(item, str) and _INVALID_STRING.search(item):
+            elif isinstance(item, str) and (
+                # ASCII не содержит суррогатов: пропускаем regex, но NUL проверяем всегда.
+                "\x00" in item or (not item.isascii() and _INVALID_STRING.search(item))
+            ):
                 raise ValueError("String unsupported by JSONB")
     except (ValueError, UnicodeError, RecursionError, DecimalException) as exc:
         raise WriterError(400, "invalid_stream", "Each line must be a valid JSON object") from exc
