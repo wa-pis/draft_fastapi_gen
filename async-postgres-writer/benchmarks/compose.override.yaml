@@ -1,0 +1,10 @@
+services:
+  postgres:
+    # Test-only access for the host-side benchmark, on a dynamic loopback port.
+    ports:
+      - "127.0.0.1::5432"
+  writer:
+    ports: !override
+      - "127.0.0.1::8080"
+    environment:
+      WRITER_DATABASE_URL: postgresql://writer:${POSTGRES_PASSWORD:?Required}@postgres:5432/stream_writer?application_name=stream_writer_benchmark
