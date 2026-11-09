@@ -22,7 +22,9 @@
   прежние receipt/timestamp и неизменное число строк в PostgreSQL.
 - RSS клиента, API и максимального отдельного API-backend PostgreSQL снимается каждые
   0,5 с во время записи, чтения и повтора. Короткие пики могут быть пропущены. RSS
-  PostgreSQL включает общие страницы и не равен памяти всего кластера.
+  PostgreSQL включает общие страницы и не равен памяти всего кластера. Если не
+  передать `--server-pid`, снимается только RSS клиента. Это режим для Docker на Mac:
+  PID процессов Linux VM нельзя подставлять в `ps` на хосте.
 - Размер таблицы включает TOAST и индексы. WAL измеряется разностью LSN до/после
   первого PUT, включая GET receipt и ожидание диагностики; это объём сгенерированного
   WAL всего кластера, а не прирост каталога `pg_wal` или точный объём одной транзакции.
@@ -94,6 +96,54 @@ wait "$server_pid"
 данные после успеха, чтобы можно было отдельно перезапустить PostgreSQL/API, выполнить
 GET по UUID из отчёта и проверить число строк. Удаление выделенной базы выполняется
 отдельно после проверки.
+
+## Через Docker Compose с PostgreSQL 17
+
+Запустите Docker и [Compose 2.24.4+](https://docs.docker.com/reference/compose-file/merge/#replace-value)
+с поддержкой `!override`, подготовьте dev-окружение (`uv sync --locked`).
+Для каждого объёма используйте отдельный новый проект и том. `compose.bulk.yaml`
+задаёт профиль WAL 8 ГиБ / 16 МиБ. Дополнение `benchmarks/compose.override.yaml`
+публикует случайные локальные порты и задаёт `application_name` для диагностики.
+Пример для выделенного проекта и Bash:
+
+```bash
+cd async-postgres-writer
+uv sync --locked
+export POSTGRES_PASSWORD=$(python3 -c 'import secrets; print(secrets.token_hex(24))')
+export WRITER_API_TOKEN=$(python3 -c 'import secrets; print(secrets.token_urlsafe(32))')
+compose=(docker compose -p writer-pg17-1g -f compose.yaml -f compose.bulk.yaml -f benchmarks/compose.override.yaml)
+"${compose[@]}" up -d --build --wait writer
+"${compose[@]}" exec -T postgres psql -X -v ON_ERROR_STOP=1 -U writer -d stream_writer \
+  -c 'ALTER SYSTEM SET track_io_timing = on' \
+  -c 'ALTER SYSTEM SET track_wal_io_timing = on' \
+  -c 'SELECT pg_reload_conf()'
+sleep 1
+"${compose[@]}" exec -T postgres psql -X -v ON_ERROR_STOP=1 -U writer -d stream_writer \
+  -c 'SHOW track_io_timing' -c 'SHOW track_wal_io_timing'
+# Оба значения должны быть on.
+"${compose[@]}" exec -T postgres psql -X -v ON_ERROR_STOP=1 -U writer -d stream_writer -c 'CHECKPOINT'
+sleep 1
+"${compose[@]}" exec -T postgres sh -c 'df -h "$PGDATA"'
+api_port=$("${compose[@]}" port writer 8080 | cut -d: -f2)
+pg_port=$("${compose[@]}" port postgres 5432 | cut -d: -f2)
+export WRITER_TEST_DATABASE_URL="postgresql://writer:${POSTGRES_PASSWORD}@127.0.0.1:${pg_port}/stream_writer"
+.venv/bin/python benchmarks/stream_load.py --url "http://127.0.0.1:${api_port}" \
+  --size-gib 1 --diagnostics --replay --disk-path /tmp \
+  --label compose-pg17-bulk-1gib --output /tmp/compose-pg17-1gib.json
+```
+
+Для 5 ГиБ замените имя проекта, `--size-gib`, метку и имя отчёта. На Mac можно
+запускать клиент через `caffeinate -i`. `--disk-path /tmp` контролирует только диск
+хоста. Отдельно отслеживайте `df` на `$PGDATA` внутри Docker на протяжении прогона:
+у обоих томов должен оставаться запас 20 ГиБ. При старте 5 ГиБ дополнительно нужно
+место под саму запись, индексы и WAL.
+
+Для проверки перезапуска остановите `writer`, штатно перезапустите `postgres` с тем же
+томом, дождитесь готовности БД и запустите `writer`. Снова выполните `compose port` для
+обоих контейнеров: их случайные порты меняются. GET по UUID из JSON должен вернуть
+исходный receipt, а `SELECT count(*) FROM stream_writer.rows WHERE upload_id = '<UUID>'`
+— то же число строк. После проверки можно выполнить `"${compose[@]}" down --volumes`
+только для созданного тестового проекта.
 
 ## Сравнить профили A/B
 

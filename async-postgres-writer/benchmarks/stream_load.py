@@ -169,7 +169,10 @@ async def measure(args: argparse.Namespace, token: str, connection: asyncpg.Conn
     upload_id = uuid4()
     headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/x-ndjson"}
     path = f"/v1/uploads/{upload_id}"
-    peaks = {"api_rss_bytes": 0, "client_rss_bytes": 0, "max_pg_backend_rss_bytes": 0}
+    server_rss = args.server_pid is not None
+    peaks = {"client_rss_bytes": 0}
+    if server_rss:
+        peaks.update(api_rss_bytes=0, max_pg_backend_rss_bytes=0)
     min_free = shutil.disk_usage(args.disk_path).free
     stop = asyncio.Event()
     low_disk = asyncio.Event()
@@ -192,12 +195,13 @@ async def measure(args: argparse.Namespace, token: str, connection: asyncpg.Conn
     async def sample():
         nonlocal min_free
         while not stop.is_set():
-            peaks["api_rss_bytes"] = max(peaks["api_rss_bytes"], rss_bytes(args.server_pid))
             peaks["client_rss_bytes"] = max(peaks["client_rss_bytes"], rss_bytes(os.getpid()))
-            for pid in pg_pids:
-                peaks["max_pg_backend_rss_bytes"] = max(
-                    peaks["max_pg_backend_rss_bytes"], rss_bytes(pid)
-                )
+            if server_rss:
+                peaks["api_rss_bytes"] = max(peaks["api_rss_bytes"], rss_bytes(args.server_pid))
+                for pid in pg_pids:
+                    peaks["max_pg_backend_rss_bytes"] = max(
+                        peaks["max_pg_backend_rss_bytes"], rss_bytes(pid)
+                    )
             min_free = min(min_free, shutil.disk_usage(args.disk_path).free)
             if min_free < 20 * GIB:
                 low_disk.set()
@@ -427,7 +431,11 @@ async def measure(args: argparse.Namespace, token: str, connection: asyncpg.Conn
         "replay_no_duplicates": args.replay,
         "sampled_peaks": peaks,
         "sampling_interval_seconds": 0.5,
-        "memory_sampling_scope": "upload, readback and replay",
+        "memory_sampling_scope": (
+            "upload, readback and replay"
+            if server_rss
+            else "client only: upload, readback and replay"
+        ),
         "disk_min_free_bytes": min_free,
         "generated_wal_bytes": int(wal_bytes),
         "sizes_before": before,
@@ -452,7 +460,11 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--url", default="http://127.0.0.1:8080")
     parser.add_argument("--size-gib", type=int, choices=(1, 5), required=True)
-    parser.add_argument("--server-pid", type=int, required=True)
+    parser.add_argument(
+        "--server-pid",
+        type=int,
+        help="Sample API and PostgreSQL RSS only when their PIDs are visible to the client",
+    )
     parser.add_argument("--disk-path", default="/private/tmp")
     parser.add_argument("--replay", action="store_true")
     parser.add_argument("--diagnostics", action="store_true")
