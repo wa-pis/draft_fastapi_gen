@@ -240,6 +240,72 @@ streams=2  # Можно выбрать 4; значение должно совп
 все строки, сравнит SHA-256 сохранённого потока и проверит повтор без дубликатов.
 После штатного перезапуска проверьте receipt и число строк для всех UUID, как выше.
 
+### A/B: обычная таблица и четыре хеш-партиции
+
+Повторите настройку Compose с `POSTGRES_WAL_BUFFERS=64MB`, `max_wal_size=8GB` и
+`WRITER_POOL_SIZE=4`. Оставьте прежние образы, ресурсы VM и параметры надёжной записи.
+На каждый прогон нужен новый проект с пустым томом. A использует схему из `init-db`.
+Для B после успешного `init-db`, но **до `CHECKPOINT`**, выполните:
+
+```bash
+"${compose[@]}" exec -T postgres psql -X -v ON_ERROR_STOP=1 -U writer -d stream_writer \
+  -f - < benchmarks/partition_rows.sql
+```
+
+Скрипт предназначен только для пустой тестовой БД. Он разбивает `stream_writer.rows`
+по `HASH (upload_id)` с `MODULUS 4`, сохраняя ограничения таблицы.
+
+Для пары A/B задайте одинаковые UUID в одном порядке: два для 2×5 ГиБ или четыре
+для 4×5 ГиБ. В B они должны попасть в разные партиции.
+В [отчёте](results/2026-11-10-compose-pg17-toast-partitions.json) выберите сценарий из
+`cases` по `label` и возьмите его `uploads[*].receipt.upload_id`.
+Заполните Bash-массив `uuids` этими значениями и задайте `project` как имя текущего
+тестового проекта. После `CHECKPOINT` и определения портов запустите:
+
+```bash
+id_args=()
+for uuid in "${uuids[@]}"; do id_args+=(--upload-id "$uuid"); done
+.venv/bin/python benchmarks/stream_load.py --url "http://127.0.0.1:${api_port}" \
+  --size-gib 5 --concurrency "${#uuids[@]}" "${id_args[@]}" --diagnostics \
+  --verify-counts-only --disk-path /tmp --min-disk-free-gib "${reserve_gib:-20}" \
+  --label "$project" --output "/tmp/${project}.json"
+```
+
+Отдельный контроль 4×5 ГиБ: на новом томе с той же схемой B задайте четыре
+разных UUID, которые попадают в `stream_writer.rows_p0`. Не смешивайте его
+с B, где загрузки распределены по четырём партициям. После каждого прогона
+проверьте размещение для каждого UUID:
+
+```sql
+SELECT tableoid::regclass AS leaf
+FROM stream_writer.rows
+WHERE upload_id = '<UUID>'::uuid
+LIMIT 1;
+```
+
+Во время записи выборка ниже показывает, какая таблица владеет TOAST, на расширении
+которого ждёт `COPY`. Снимайте её с одинаковым интервалом, например 0,5 с.
+
+```sql
+SELECT c.oid::regclass AS owning_table, l.relation::regclass AS toast_table,
+       count(*) AS waiting_copy_backends
+FROM pg_locks l
+JOIN pg_stat_progress_copy p USING (pid)
+JOIN pg_stat_activity a USING (pid)
+JOIN pg_class c ON c.reltoastrelid = l.relation
+WHERE l.locktype = 'extend' AND NOT l.granted
+  AND a.application_name = 'stream_writer_benchmark'
+  AND l.database = (SELECT oid FROM pg_database WHERE datname = current_database())
+GROUP BY c.oid, l.relation;
+```
+
+Отслеживайте свободное место на хосте и на томе `$PGDATA` внутри PostgreSQL.
+Для B скрипт суммирует `pg_total_relation_size(relid)` по листьям `pg_partition_tree`:
+размер родительской таблицы не включает данные партиций. Сравнивайте одинаковые
+объёмы и режимы проверки. Для полного чтения, проверки SHA-256 и повтора PUT
+на новом томе замените `--verify-counts-only` на `--replay`. После штатного
+перезапуска снова проверьте подтверждения, число строк и их размещение.
+
 ### Таблица результатов с 25 типизированными колонками
 
 `stream_writer_bench.typed_rows` — отдельная таблица для тестовых результатов
