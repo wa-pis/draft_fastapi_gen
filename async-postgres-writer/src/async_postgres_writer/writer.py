@@ -1,6 +1,6 @@
 import asyncio
 import hashlib
-from collections.abc import AsyncIterable
+from collections.abc import AsyncIterable, AsyncIterator
 from dataclasses import dataclass, replace
 from datetime import datetime
 from uuid import UUID
@@ -29,6 +29,8 @@ def _receipt(row: asyncpg.Record) -> Receipt:
 
 
 class Store:
+    _rows_check = "SELECT upload_id, row_number, data FROM stream_writer.rows LIMIT 0"
+
     def __init__(self, settings: Settings, pool: asyncpg.Pool) -> None:
         self.settings = settings
         self.pool = pool
@@ -40,9 +42,7 @@ class Store:
                     "SELECT upload_id, sha256, row_count, byte_count, committed_at "
                     "FROM stream_writer.uploads LIMIT 0"
                 )
-                await conn.fetchrow(
-                    "SELECT upload_id, row_number, data FROM stream_writer.rows LIMIT 0"
-                )
+                await conn.fetchrow(self._rows_check)
         except (asyncpg.PostgresError, asyncpg.InterfaceError, OSError, TimeoutError) as exc:
             raise WriterError(503, "database_unavailable", "Database is not ready") from exc
 
@@ -99,17 +99,7 @@ class Store:
                                 "0" * 64,
                             )
 
-                            async def records():
-                                async for number, text in stream:
-                                    yield upload_id, number, text
-
-                            await conn.copy_records_to_table(
-                                "rows",
-                                schema_name="stream_writer",
-                                columns=("upload_id", "row_number", "data"),
-                                records=records(),
-                                timeout=settings.upload_timeout_seconds,
-                            )
+                            await self._copy_rows(conn, upload_id, stream)
                             row = await conn.fetchrow(
                                 "UPDATE stream_writer.uploads SET sha256=$2, row_count=$3, "
                                 "byte_count=$4, committed_at=clock_timestamp() "
@@ -135,6 +125,21 @@ class Store:
             raise self._unavailable(phase) from exc
         except (asyncpg.PostgresError, asyncpg.InterfaceError, OSError) as exc:
             raise self._unavailable(phase) from exc
+
+    async def _copy_rows(
+        self, conn: asyncpg.Connection, upload_id: UUID, stream: NDJSONStream
+    ) -> None:
+        async def records() -> AsyncIterator[tuple[UUID, int, str]]:
+            async for number, text in stream:
+                yield upload_id, number, text
+
+        await conn.copy_records_to_table(
+            "rows",
+            schema_name="stream_writer",
+            columns=("upload_id", "row_number", "data"),
+            records=records(),
+            timeout=self.settings.upload_timeout_seconds,
+        )
 
     @staticmethod
     def _unavailable(phase: str) -> WriterError:

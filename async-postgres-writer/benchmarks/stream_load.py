@@ -15,7 +15,7 @@ import time
 from contextlib import suppress
 from decimal import Decimal
 from pathlib import Path
-from uuid import uuid4
+from uuid import UUID, uuid4
 
 import asyncpg
 import httpx
@@ -204,9 +204,9 @@ async def upload_batch(client, headers, upload_ids, body, total_bytes, total_row
     return [result[0] for result in results], finished, wall_finished
 
 
-async def verify_upload_counts(connection, upload_id, total_rows):
+async def verify_upload_counts(connection, upload_id, total_rows, table="stream_writer.rows"):
     counts = await connection.fetchrow(
-        "SELECT (SELECT count(*) FROM stream_writer.rows WHERE upload_id=$1) AS rows, "
+        f"SELECT (SELECT count(*) FROM {table} WHERE upload_id=$1) AS rows, "
         "(SELECT count(*) FROM stream_writer.uploads WHERE upload_id=$1) AS uploads",
         upload_id,
     )
@@ -219,6 +219,23 @@ async def verify_upload_counts(connection, upload_id, total_rows):
         "replay_seconds": None,
         "replay_no_duplicates": False,
     }
+
+
+def verify_mixed_row(layout, row, upload_id, row_number, encoded):
+    from typed_data import TYPED_COLUMNS, typed_record
+
+    assert row["row_number"] == row_number
+    if layout == "columns":
+        expected = typed_record(upload_id, row_number, encoded.decode())
+        for column, value in zip(TYPED_COLUMNS, expected, strict=True):
+            stored = row[column]
+            if column == "metrics" and value is not None:
+                assert stored is not None
+                assert json.loads(stored) == json.loads(value)
+            else:
+                assert stored == value, (row_number, column)
+    else:
+        assert json.loads(row["data"]) == json.loads(encoded)
 
 
 async def run(args: argparse.Namespace) -> dict:
@@ -241,7 +258,27 @@ async def measure(args: argparse.Namespace, token: str, connection: asyncpg.Conn
     total_rows = total_bytes // ROW_BYTES
     concurrency = getattr(args, "concurrency", 1)
     counts_only = getattr(args, "verify_counts_only", False)
-    upload_ids = [uuid4() for _ in range(concurrency)]
+    mixed_layout = getattr(args, "mixed_layout", None)
+    table = "stream_writer_bench.typed_rows" if mixed_layout == "columns" else "stream_writer.rows"
+    row_generator = row_bytes
+    if mixed_layout:
+        from typed_data import typed_row_bytes
+
+        row_generator = typed_row_bytes
+        target = await connection.fetchrow(
+            "SELECT relkind::text, relpersistence::text, EXISTS ("
+            "SELECT FROM pg_constraint WHERE conrelid=pg_class.oid AND contype='f' "
+            "AND convalidated AND confrelid='stream_writer.uploads'::regclass) "
+            "FROM pg_class WHERE oid=$1::text::regclass",
+            table,
+        )
+        if tuple(target) != ("r", "p", True) or await connection.fetchval(
+            f"SELECT EXISTS(SELECT FROM {table})"
+        ):
+            raise RuntimeError(
+                "Mixed benchmark requires a fresh, logged, unpartitioned row table with receipt FK"
+            )
+    upload_ids = getattr(args, "upload_ids", None) or [uuid4() for _ in range(concurrency)]
     headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/x-ndjson"}
     server_rss = args.server_pid is not None
     peaks = {"client_rss_bytes": 0}
@@ -309,7 +346,7 @@ async def measure(args: argparse.Namespace, token: str, connection: asyncpg.Conn
                 raise RuntimeError(
                     f"Benchmark aborted: free disk fell below {min_disk_free_gib} GiB"
                 )
-            chunk.extend(row_bytes(number, generator))
+            chunk.extend(row_generator(number, generator))
             if len(chunk) == CHUNK_BYTES:
                 digest.update(chunk)
                 yielded_at = time.monotonic() if diagnostics_enabled and label == "upload" else None
@@ -342,10 +379,20 @@ async def measure(args: argparse.Namespace, token: str, connection: asyncpg.Conn
     async def sizes():
         row = await connection.fetchrow(
             "SELECT pg_database_size(current_database()) AS database_bytes, "
-            "pg_total_relation_size('stream_writer.rows') AS rows_relation_bytes, "
-            "pg_total_relation_size('stream_writer.uploads') AS receipts_relation_bytes"
+            "COALESCE((SELECT sum(pg_total_relation_size(relid))::bigint "
+            "FROM pg_partition_tree($1::text::regclass) WHERE isleaf), "
+            "pg_total_relation_size($1::text::regclass)) AS rows_relation_bytes, "
+            "pg_total_relation_size('stream_writer.uploads') AS receipts_relation_bytes",
+            table,
         )
-        return dict(row)
+        result = dict(row)
+        if mixed_layout:
+            result["rows_toast_relation_bytes"] = await connection.fetchval(
+                "SELECT pg_total_relation_size(reltoastrelid) "
+                "FROM pg_class WHERE oid=$1::text::regclass",
+                table,
+            )
+        return result
 
     before = await sizes()
     settings = dict(
@@ -450,32 +497,41 @@ async def measure(args: argparse.Namespace, token: str, connection: asyncpg.Conn
                 "SELECT pg_wal_lsn_diff($1::pg_lsn, $2::pg_lsn)", lsn_after, lsn_before
             )
             after = await sizes()
+            select_columns = "*" if mixed_layout == "columns" else "row_number, data"
             for index, (upload_id, upload) in enumerate(zip(upload_ids, uploads, strict=True)):
                 if counts_only:
-                    upload.update(await verify_upload_counts(connection, upload_id, total_rows))
+                    upload.update(
+                        await verify_upload_counts(connection, upload_id, total_rows, table)
+                    )
                     continue
                 receipt = upload["receipt"]
                 stored_digest = hashlib.sha256()
                 stored_rows = 0
                 read_started = time.monotonic()
                 read_label = stream_label("readback", index, concurrency)
+                expected_generator = random.Random(SEED)
                 async with connection.transaction(readonly=True):
                     async for row in connection.cursor(
-                        "SELECT row_number, data FROM stream_writer.rows "
-                        "WHERE upload_id=$1 ORDER BY row_number",
+                        f"SELECT {select_columns} FROM {table} WHERE upload_id=$1 ORDER BY row_number",
                         upload_id,
                         prefetch=256,
                     ):
                         stored_rows += 1
-                        data = json.loads(row["data"])
-                        assert set(data) == {"n", "payload"}
-                        assert row["row_number"] == stored_rows == data["n"]
-                        encoded = (
-                            json.dumps(
-                                {"n": data["n"], "payload": data["payload"]}, separators=(",", ":")
-                            ).encode()
-                            + b"\n"
-                        )
+                        assert row["row_number"] == stored_rows
+                        if mixed_layout:
+                            encoded = row_generator(stored_rows, expected_generator)
+                            verify_mixed_row(mixed_layout, row, upload_id, stored_rows, encoded)
+                        else:
+                            data = json.loads(row["data"])
+                            assert set(data) == {"n", "payload"}
+                            assert stored_rows == data["n"]
+                            encoded = (
+                                json.dumps(
+                                    {"n": data["n"], "payload": data["payload"]},
+                                    separators=(",", ":"),
+                                ).encode()
+                                + b"\n"
+                            )
                         assert len(encoded) == ROW_BYTES
                         stored_digest.update(encoded)
                         if stored_rows % (256 * 1024**2 // ROW_BYTES) == 0:
@@ -500,7 +556,7 @@ async def measure(args: argparse.Namespace, token: str, connection: asyncpg.Conn
                     assert replay_digest.hexdigest() == receipt["sha256"]
                     assert (
                         await connection.fetchval(
-                            "SELECT count(*) FROM stream_writer.rows WHERE upload_id=$1", upload_id
+                            f"SELECT count(*) FROM {table} WHERE upload_id=$1", upload_id
                         )
                         == total_rows
                     )
@@ -512,7 +568,7 @@ async def measure(args: argparse.Namespace, token: str, connection: asyncpg.Conn
                     replay_no_duplicates=args.replay,
                 )
             counts = await connection.fetchrow(
-                "SELECT (SELECT count(*) FROM stream_writer.rows) AS rows, "
+                f"SELECT (SELECT count(*) FROM {table}) AS rows, "
                 "(SELECT count(*) FROM stream_writer.uploads) AS uploads"
             )
             assert counts["rows"] == total_rows * concurrency and counts["uploads"] == concurrency
@@ -556,6 +612,11 @@ async def measure(args: argparse.Namespace, token: str, connection: asyncpg.Conn
         result["uploads"] = uploads
     if counts_only:
         result["verification_mode"] = "counts_only"
+    if mixed_layout:
+        result["input_profile"] = "mixed-25"
+        result["storage_layout"] = mixed_layout
+        if not counts_only:
+            result["verification_mode"] = "all_values_against_seeded_input"
     if diagnostics_enabled:
         result["diagnostics"] = diagnostics
     if getattr(args, "label", None) is not None:
@@ -571,6 +632,13 @@ def main():
     parser.add_argument("--size-gib", type=int, choices=(1, 5), required=True)
     parser.add_argument("--concurrency", type=int, choices=(1, 2, 4), default=1)
     parser.add_argument(
+        "--upload-id",
+        dest="upload_ids",
+        type=UUID,
+        action="append",
+        help="Repeat once per PUT to use fixed IDs instead of random UUIDs",
+    )
+    parser.add_argument(
         "--server-pid",
         type=int,
         help="Sample API and PostgreSQL RSS only when their PIDs are visible to the client",
@@ -584,9 +652,18 @@ def main():
         help="Verify receipts and database row counts without full readback or replay",
     )
     parser.add_argument("--diagnostics", action="store_true")
+    parser.add_argument(
+        "--mixed-layout",
+        choices=("jsonb", "columns"),
+        help="Send the same mixed-type NDJSON to the regular JSONB or benchmark-only typed writer",
+    )
     parser.add_argument("--label")
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args()
+    if args.upload_ids is not None and (
+        len(args.upload_ids) != args.concurrency or len(set(args.upload_ids)) != args.concurrency
+    ):
+        parser.error("Provide exactly --concurrency distinct --upload-id values")
     if args.min_disk_free_gib < 1:
         parser.error("--min-disk-free-gib must be at least 1")
     if args.verify_counts_only and args.replay:

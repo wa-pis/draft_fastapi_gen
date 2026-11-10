@@ -1,5 +1,7 @@
 import asyncio
 import hashlib
+import json
+import sys
 from importlib.util import module_from_spec, spec_from_file_location
 from pathlib import Path
 from uuid import uuid4
@@ -120,3 +122,31 @@ async def test_counts_only_checks_both_database_counts_without_reporting_readbac
         connection.counts = mismatched
         with pytest.raises(AssertionError):
             await benchmark.verify_upload_counts(connection, upload_id, 3)
+
+
+def test_cli_preserves_fixed_upload_id_order(monkeypatch, tmp_path):
+    first, second = uuid4(), uuid4()
+    output = tmp_path / "benchmark.json"
+    argv = [
+        "stream_load.py",
+        "--size-gib",
+        "5",
+        "--concurrency",
+        "2",
+        "--output",
+        str(output),
+    ]
+
+    async def run(args):
+        return {"upload_ids": [str(key) for key in args.upload_ids]}
+
+    monkeypatch.setattr(benchmark, "run", run)
+    monkeypatch.setattr(sys, "argv", [*argv, "--upload-id", str(first), "--upload-id", str(second)])
+    benchmark.main()
+    assert json.loads(output.read_text())["upload_ids"] == [str(first), str(second)]
+
+    for invalid in (["--upload-id", str(first)], ["--upload-id", str(first)] * 2):
+        monkeypatch.setattr(sys, "argv", [*argv, *invalid])
+        with pytest.raises(SystemExit) as error:
+            benchmark.main()
+        assert error.value.code == 2
