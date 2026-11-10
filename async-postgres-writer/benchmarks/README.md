@@ -240,6 +240,91 @@ streams=2  # Можно выбрать 4; значение должно совп
 все строки, сравнит SHA-256 сохранённого потока и проверит повтор без дубликатов.
 После штатного перезапуска проверьте receipt и число строк для всех UUID, как выше.
 
+### Таблица результатов с 25 типизированными колонками
+
+`stream_writer_bench.typed_rows` — отдельная таблица для тестовых результатов
+расчёта. Всего 25 колонок, включая `upload_id` и `row_number` (составной первичный
+ключ). Сумма хранится в `numeric(18,2)`, даты и время — в отдельных типах. В таблице
+также есть сетевые адреса, массивы, диапазоны, флаги, `bytea` и поле `jsonb` для
+дополнительных метрик. HTTP-сервис продолжает писать в `stream_writer.rows`.
+
+Подключитесь к тестовой базе и выполните из каталога приложения:
+
+```bash
+psql "$WRITER_TEST_DATABASE_URL" -X -v ON_ERROR_STOP=1 \
+  -f benchmarks/typed_rows.sql -f benchmarks/typed_rows_sample.sql
+psql "$WRITER_TEST_DATABASE_URL" -X \
+  -c 'SELECT upload_id, count(*) FROM stream_writer_bench.typed_rows GROUP BY upload_id;'
+```
+
+Пример загружает по пять строк для двух фиксированных UUID, включая значения
+`NULL` в необязательных полях. Повторный запуск не добавляет дубликаты. Это
+набор для проверки типов и `COPY`, объём нагрузки для замера задаётся отдельно.
+
+#### Сравнение типизированных колонок и JSONB
+
+Оба режима получают один и тот же NDJSON из `typed_data.py`: 4 096 байт на
+строку с LF, ровно 1 310 720 строк на 5 ГиБ. UUID передаётся в URL, а номер строки
+включён в тело. Случайное заполнение хранится в `description` (или в `metrics.note`
+для каждой двадцатой строки). Это данные, которые записывают оба варианта; размер
+не набирается пробелами. Остальные поля включают числа, даты, массивы и `NULL`.
+JSONB сохраняет весь объект; вариант с колонками преобразует поля в типы PostgreSQL
+и загружает их двоичным COPY. Время включает преобразование и подтверждение коммита.
+
+Возьмите массив `compose` из примера выше с новым проектом для каждого сценария.
+Установите WAL-буфер 64 МиБ и пул из четырёх соединений. Добавляйте
+`compose.typed.yaml` только для варианта с колонками:
+
+```bash
+export POSTGRES_WAL_BUFFERS=64MB WRITER_POOL_SIZE=4
+layout=columns # или jsonb
+if [ "$layout" = columns ]; then
+  compose+=(-f benchmarks/compose.typed.yaml)
+fi
+"${compose[@]}" build writer
+"${compose[@]}" up -d --wait postgres
+"${compose[@]}" up -d init-db
+"${compose[@]}" wait init-db
+for sql in typed_rows.sql typed_rows_fk.sql; do
+  "${compose[@]}" exec -T postgres psql -X -v ON_ERROR_STOP=1 -U writer -d stream_writer \
+    -f - < "benchmarks/$sql"
+done
+"${compose[@]}" up -d --wait writer
+```
+
+Два SQL-файла применяются к обоим проектам для одинаковой начальной схемы;
+файл с демонстрационными данными не нужен. Обе целевые таблицы журналируются,
+имеют составной первичный ключ и внешний ключ на квитанцию. Для каждой загрузки
+строки и квитанция коммитятся вместе; `fsync`, `full_page_writes` и
+`synchronous_commit` должны быть `on`. Включите I/O timing, выполните
+`CHECKPOINT` и получите порты, как в примере выше. Затем:
+
+```bash
+streams=2 # или 4, с новым проектом и томом
+ids=()
+for ((i=1; i<=streams; i++)); do
+  ids+=(--upload-id "20000000-0000-4000-8000-00000000000$i")
+done
+report="/tmp/mixed-$layout-$streams.json"
+.venv/bin/python benchmarks/stream_load.py --url "http://127.0.0.1:${api_port}" \
+  --mixed-layout "$layout" --size-gib 5 --concurrency "$streams" --diagnostics \
+  --disk-path /tmp --verify-counts-only "${ids[@]}" --output "$report"
+```
+
+После штатного перезапуска PostgreSQL с тем же томом снова определите порты,
+обновите `WRITER_TEST_DATABASE_URL` и запустите:
+
+```bash
+.venv/bin/python benchmarks/verify_mixed_restart.py --url "http://127.0.0.1:${api_port}" "$report"
+```
+
+Этот шаг сверяет квитанции, общее число строк, границы номеров и все поля первых
+32 строк каждой загрузки. Без `--verify-counts-only` загрузчик сверяет каждое
+сохранённое значение с детерминированным входом, а `--replay` дополнительно проверяет
+повтор без дублей. Чтение и повтор выполняются вне таймера записи. Сравнивайте
+скорость между режимами с одним и тем же входом: предыдущие замеры JSONB
+использовали другой, двухполевый объект.
+
 ## Сравнить профили A/B
 
 Меняйте по одному фактору, сохраняя PostgreSQL/Python, зависимости, генератор,

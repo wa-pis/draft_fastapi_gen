@@ -17,7 +17,7 @@ from .config import Settings
 from .writer import Store, WriterError
 
 
-def create_app(settings: Settings | None = None) -> FastAPI:
+def create_app(settings: Settings | None = None, *, store_type: type[Store] = Store) -> FastAPI:
     settings = settings or Settings()
 
     @asynccontextmanager
@@ -32,7 +32,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             )
         except (asyncpg.PostgresError, asyncpg.InterfaceError, OSError, TimeoutError, ValueError):
             raise RuntimeError("Database connection unavailable") from None
-        app.state.store = Store(settings, pool)
+        app.state.store = store_type(settings, pool)
         try:
             yield
         finally:

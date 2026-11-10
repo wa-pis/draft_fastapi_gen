@@ -1,0 +1,6 @@
+services:
+  writer:
+    entrypoint: ["/app/.venv/bin/python", "-m", "uvicorn"]
+    command: ["benchmarks.typed_writer:create_typed_app", "--factory", "--host", "0.0.0.0", "--port", "8080"]
+    volumes:
+      - ./benchmarks:/app/benchmarks:ro
