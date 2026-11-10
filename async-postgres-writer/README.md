@@ -183,6 +183,9 @@ docker compose -f compose.yaml -f compose.bulk.yaml up --build -d writer
 и [настройки WAL](https://www.postgresql.org/docs/14/runtime-config-wal.html).
 Профиль проверен с PostgreSQL 17 в локальном Compose. См. [сравнение замеров](VALIDATION.md#docker-compose-и-postgresql-17)
 и [инструкцию по повтору](benchmarks/README.md#через-docker-compose-с-postgresql-17).
+Для параллельных загрузок можно задать `POSTGRES_WAL_BUFFERS=64MB` перед запуском
+с `compose.bulk.yaml`. Без этой переменной действует прежний буфер 16 МиБ. Параметры
+надёжной записи не меняются. См. [замеры параллельной записи](VALIDATION.md#повтор-параллельных-замеров-и-настройка-wal-буфера).
 
 Контейнер работает от UID 10001. В образе установлено приложение из wheel с зависимостями
 по lock-файлу; PyInstaller не используется.
