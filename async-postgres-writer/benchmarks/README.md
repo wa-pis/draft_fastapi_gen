@@ -197,6 +197,49 @@ WAL и фактический размер `pg_wal` различаются. `--m
 `df` на `$PGDATA` внутри PostgreSQL, сохраняя резерв и там. Номинальный размер
 диска VM не добавляет физического свободного места на хосте.
 
+### A/B: буфер WAL 16 и 64 МиБ
+
+Меняйте только `wal_buffers`. Оставьте `max_wal_size=8GB`, `shared_buffers=128MB`,
+прежний `wal_sync_method`, оба I/O timing, пул из четырёх соединений и тот же уровень
+параллельности. Используйте одинаковые образы, VM, диски, клиент и входные данные.
+На каждый прогон создавайте новый Compose-проект с пустым томом и выполняйте `CHECKPOINT`
+перед замером. При наличии места повторите прогоны в порядке 16 → 64 → 64 → 16.
+
+В процедуре Compose выше замените объявление `compose` следующим блоком. Для второго
+профиля установите `wal_buffers=64MB`; для каждого повтора задайте новый `run`.
+
+```bash
+wal_buffers=16MB
+run=1
+export POSTGRES_WAL_BUFFERS="$wal_buffers" WRITER_POOL_SIZE=4
+project="writer-pg17-wal${wal_buffers%MB}-${run}"
+compose=(docker compose -p "$project" -f compose.yaml -f compose.bulk.yaml
+         -f benchmarks/compose.override.yaml)
+```
+
+Запустите проект, настройте I/O timing и определите порты по инструкции выше.
+Проверьте через `SHOW`, что применился нужный `wal_buffers`, а `max_wal_size` и три
+настройки надёжной записи совпадают. После `CHECKPOINT` выполните:
+
+```bash
+streams=2  # Можно выбрать 4; значение должно совпадать для A и B.
+.venv/bin/python benchmarks/stream_load.py --url "http://127.0.0.1:${api_port}" \
+  --size-gib 5 --concurrency "$streams" --diagnostics --verify-counts-only \
+  --disk-path /tmp --min-disk-free-gib 20 --label "$project" \
+  --output "/tmp/${project}.json"
+```
+
+Сравнивайте время группы, задержки отдельных PUT и счётчики WAL на ГиБ входа.
+`--verify-counts-only` сохраняет прежний таймер записи и проверяет receipt, GET,
+число строк по каждому UUID и общий итог. Он не читает содержимое строк из БД,
+не вычисляет SHA-256 сохранённых данных и не проверяет повтор PUT. В JSON такой
+отчёт помечен `verification_mode: counts_only`.
+
+Для выбранного профиля повторите весь прогон на новом томе с тем же уровнем
+параллельности, заменив `--verify-counts-only` на `--replay`. Так скрипт прочитает
+все строки, сравнит SHA-256 сохранённого потока и проверит повтор без дубликатов.
+После штатного перезапуска проверьте receipt и число строк для всех UUID, как выше.
+
 ## Сравнить профили A/B
 
 Меняйте по одному фактору, сохраняя PostgreSQL/Python, зависимости, генератор,

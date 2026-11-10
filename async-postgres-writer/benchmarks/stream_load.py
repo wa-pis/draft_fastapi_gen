@@ -204,6 +204,23 @@ async def upload_batch(client, headers, upload_ids, body, total_bytes, total_row
     return [result[0] for result in results], finished, wall_finished
 
 
+async def verify_upload_counts(connection, upload_id, total_rows):
+    counts = await connection.fetchrow(
+        "SELECT (SELECT count(*) FROM stream_writer.rows WHERE upload_id=$1) AS rows, "
+        "(SELECT count(*) FROM stream_writer.uploads WHERE upload_id=$1) AS uploads",
+        upload_id,
+    )
+    assert counts["rows"] == total_rows and counts["uploads"] == 1
+    return {
+        "verified_row_count": counts["rows"],
+        "readback_seconds": None,
+        "readback_sha256": None,
+        "readback_row_count": None,
+        "replay_seconds": None,
+        "replay_no_duplicates": False,
+    }
+
+
 async def run(args: argparse.Namespace) -> dict:
     token = os.environ["WRITER_API_TOKEN"]
     connection = await asyncpg.connect(
@@ -223,6 +240,7 @@ async def measure(args: argparse.Namespace, token: str, connection: asyncpg.Conn
     total_bytes = args.size_gib * GIB
     total_rows = total_bytes // ROW_BYTES
     concurrency = getattr(args, "concurrency", 1)
+    counts_only = getattr(args, "verify_counts_only", False)
     upload_ids = [uuid4() for _ in range(concurrency)]
     headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/x-ndjson"}
     server_rss = args.server_pid is not None
@@ -433,6 +451,9 @@ async def measure(args: argparse.Namespace, token: str, connection: asyncpg.Conn
             )
             after = await sizes()
             for index, (upload_id, upload) in enumerate(zip(upload_ids, uploads, strict=True)):
+                if counts_only:
+                    upload.update(await verify_upload_counts(connection, upload_id, total_rows))
+                    continue
                 receipt = upload["receipt"]
                 stored_digest = hashlib.sha256()
                 stored_rows = 0
@@ -502,6 +523,7 @@ async def measure(args: argparse.Namespace, token: str, connection: asyncpg.Conn
         raise RuntimeError("Free disk fell below the benchmark reserve")
     if any(value <= 0 for value in peaks.values()):
         raise RuntimeError("A process memory measurement is missing")
+    memory_scope = "upload and count verification" if counts_only else "upload, readback and replay"
     result = {
         "size_gib": args.size_gib,
         "concurrency": concurrency,
@@ -515,11 +537,7 @@ async def measure(args: argparse.Namespace, token: str, connection: asyncpg.Conn
         "replay_no_duplicates": args.replay,
         "sampled_peaks": peaks,
         "sampling_interval_seconds": 0.5,
-        "memory_sampling_scope": (
-            "upload, readback and replay"
-            if server_rss
-            else "client only: upload, readback and replay"
-        ),
+        "memory_sampling_scope": memory_scope if server_rss else f"client only: {memory_scope}",
         "disk_min_free_bytes": min_free,
         "disk_reserve_bytes": disk_reserve_bytes,
         "generated_wal_bytes": int(wal_bytes),
@@ -536,6 +554,8 @@ async def measure(args: argparse.Namespace, token: str, connection: asyncpg.Conn
         result.update({key: value for key, value in uploads[0].items() if key not in result})
     else:
         result["uploads"] = uploads
+    if counts_only:
+        result["verification_mode"] = "counts_only"
     if diagnostics_enabled:
         result["diagnostics"] = diagnostics
     if getattr(args, "label", None) is not None:
@@ -558,12 +578,19 @@ def main():
     parser.add_argument("--disk-path", default="/private/tmp")
     parser.add_argument("--min-disk-free-gib", type=int, default=20)
     parser.add_argument("--replay", action="store_true")
+    parser.add_argument(
+        "--verify-counts-only",
+        action="store_true",
+        help="Verify receipts and database row counts without full readback or replay",
+    )
     parser.add_argument("--diagnostics", action="store_true")
     parser.add_argument("--label")
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args()
     if args.min_disk_free_gib < 1:
         parser.error("--min-disk-free-gib must be at least 1")
+    if args.verify_counts_only and args.replay:
+        parser.error("--verify-counts-only cannot be combined with --replay")
     result = asyncio.run(run(args))
     args.output.write_text(json.dumps(result, indent=2) + "\n")
     print(json.dumps(result, indent=2), flush=True)

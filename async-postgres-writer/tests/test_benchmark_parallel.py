@@ -96,3 +96,27 @@ async def test_activity_counts_overlapping_copies_across_wait_event_groups():
     assert result["peak_active_copy_backends"] == 3
     assert result["active_copy_backend_histogram"] == {"3": 1}
     assert pids == {101, 102, 103, 104}
+
+
+async def test_counts_only_checks_both_database_counts_without_reporting_readback_or_replay():
+    upload_id = uuid4()
+
+    class Connection:
+        def __init__(self):
+            self.counts = {"rows": 3, "uploads": 1}
+
+        async def fetchrow(self, query, key):
+            assert key == upload_id
+            return self.counts
+
+    connection = Connection()
+    result = await benchmark.verify_upload_counts(connection, upload_id, 3)
+    assert result["verified_row_count"] == 3
+    assert result["readback_sha256"] is None
+    assert result["replay_seconds"] is None
+    assert result["replay_no_duplicates"] is False
+
+    for mismatched in ({"rows": 2, "uploads": 1}, {"rows": 3, "uploads": 0}):
+        connection.counts = mismatched
+        with pytest.raises(AssertionError):
+            await benchmark.verify_upload_counts(connection, upload_id, 3)

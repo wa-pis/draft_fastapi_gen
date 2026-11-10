@@ -17,4 +17,4 @@ services:
       - -c
       - max_wal_size=8GB
       - -c
-      - wal_buffers=16MB
+      - wal_buffers=${POSTGRES_WAL_BUFFERS:-16MB}
