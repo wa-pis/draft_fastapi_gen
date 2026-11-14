@@ -1,6 +1,7 @@
 import asyncio
 import hashlib
 import json
+from decimal import Decimal
 
 import pytest
 
@@ -54,6 +55,21 @@ async def test_parser_applies_backpressure_to_chunk_source():
     assert seen == [1, 2]
     with pytest.raises(StopAsyncIteration):
         await anext(source)
+
+
+async def test_decoded_records_keep_decimal_precision_and_strict_keys():
+    payload = b'{"integer":1,"fraction":0.123456789012345678901,"exponent":1e-30}\n'
+    source = stream(chunks(payload))
+    [(number, row)] = [item async for item in source.decoded_records()]
+    assert number == 1
+    assert type(row["integer"]) is int
+    assert row["fraction"] == Decimal("0.123456789012345678901")
+    assert row["exponent"] == Decimal("1e-30")
+
+    duplicate = stream(chunks(b'{"value":1,"value":2}\n'))
+    with pytest.raises(WriterError) as error:
+        _ = [item async for item in duplicate.decoded_records()]
+    assert (error.value.status_code, error.value.code) == (400, "invalid_stream")
 
 
 @pytest.mark.parametrize(

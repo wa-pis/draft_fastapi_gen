@@ -97,9 +97,10 @@ def _range(value, convert):
     return Range(convert(lower), convert(upper))
 
 
-def typed_record(upload_id: UUID, row_number: int, line: str) -> tuple:
-    """Convert one benchmark row to the native values expected by asyncpg COPY."""
-    row = json.loads(line)
+def typed_record(upload_id: UUID, row_number: int, row: dict[str, object] | str) -> tuple:
+    """Convert a decoded row (or seed text during readback) for asyncpg COPY."""
+    if isinstance(row, str):
+        row = json.loads(row, parse_float=Decimal)
     if not isinstance(row, dict) or row.keys() != _WIRE_FIELDS:
         raise ValueError("Unexpected typed benchmark fields")
     if type(row["row_number"]) is not int or row["row_number"] != row_number:
@@ -116,11 +117,13 @@ def typed_record(upload_id: UUID, row_number: int, line: str) -> tuple:
         flags = row["quality_flags"]
         if not isinstance(flags, str) or len(flags) != 8 or flags.strip("01"):
             raise ValueError("quality_flags must contain eight binary digits")
+        confidence, score = row["confidence"], row["score"]
         metrics = row["metrics"]
         if metrics is not None:
             if not isinstance(metrics, dict):
                 raise ValueError("metrics must be a JSON object")
-            metrics = json.dumps(metrics, separators=(",", ":"), allow_nan=False)
+            # Keep the benchmark's existing float precision for metrics JSON.
+            metrics = json.dumps(metrics, separators=(",", ":"), allow_nan=False, default=float)
 
         return (
             upload_id,
@@ -132,8 +135,8 @@ def typed_record(upload_id: UUID, row_number: int, line: str) -> tuple:
             row["description"],
             row["is_final"],
             Decimal(row["amount"]),
-            row["confidence"],
-            row["score"],
+            float(confidence) if isinstance(confidence, Decimal) else confidence,
+            float(score) if isinstance(score, Decimal) else score,
             date.fromisoformat(row["calculation_date"]),
             calculated_at,
             local_at,
