@@ -80,7 +80,7 @@ async def measure_export(client: httpx.AsyncClient, path: str, expected_rows: in
     count = size = 0
     first = None
     digest = hashlib.sha256()
-    cpu_start, start = process_time(), perf_counter()
+    start = perf_counter()
     async with client.stream("GET", path + "/rows/stream") as response:
         response.raise_for_status()
         _require(
@@ -95,7 +95,6 @@ async def measure_export(client: httpx.AsyncClient, path: str, expected_rows: in
             size += len(chunk)
             digest.update(chunk)
     elapsed = perf_counter() - start
-    client_cpu = process_time() - cpu_start
     _require(first is not None and count == expected_rows, f"Incomplete export: {count} lines")
     return {
         "seconds": elapsed,
@@ -105,10 +104,38 @@ async def measure_export(client: httpx.AsyncClient, path: str, expected_rows: in
         "sha256": digest.hexdigest(),
         "rows_per_second": count / elapsed,
         "mib_per_second": size / _MIB / elapsed,
+    }
+
+
+async def measure_concurrent_exports(
+    client: httpx.AsyncClient, path: str, expected_rows: int, concurrency: int
+) -> dict:
+    ready = asyncio.Barrier(concurrency)
+
+    async def export() -> dict:
+        await ready.wait()
+        return await measure_export(client, path, expected_rows)
+
+    cpu_start, start = process_time(), perf_counter()
+    async with asyncio.TaskGroup() as group:
+        tasks = [group.create_task(export()) for _ in range(concurrency)]
+    elapsed = perf_counter() - start
+    client_cpu = process_time() - cpu_start
+    streams = [task.result() for task in tasks]
+    rows = sum(stream["rows"] for stream in streams)
+    size = sum(stream["bytes"] for stream in streams)
+    return {
+        "concurrency": concurrency,
+        "seconds": elapsed,
+        "rows": rows,
+        "bytes": size,
+        "rows_per_second": rows / elapsed,
+        "mib_per_second": size / _MIB / elapsed,
         "client_cpu_seconds": client_cpu,
         # macOS reports bytes; Linux reports KiB.
         "client_peak_rss_bytes": resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
         * (1 if sys.platform == "darwin" else 1024),
+        "streams": streams,
     }
 
 
@@ -147,6 +174,9 @@ async def measure(args: argparse.Namespace) -> dict:
             "Authorization": f"Bearer {os.environ['WRITER_API_TOKEN']}",
             "Accept-Encoding": "identity",
         },
+        limits=httpx.Limits(
+            max_connections=args.concurrency, max_keepalive_connections=args.concurrency
+        ),
         timeout=args.timeout,
         trust_env=False,
     ) as client:
@@ -154,7 +184,29 @@ async def measure(args: argparse.Namespace) -> dict:
         receipt.raise_for_status()
         _require(receipt.json()["row_count"] == args.expected_rows, "Wrong receipt row count")
         if not args.pages_only:
-            result["stream"] = await measure_export(client, path, args.expected_rows)
+            result["concurrent_export"] = run = await measure_concurrent_exports(
+                client, path, args.expected_rows, args.concurrency
+            )
+            streams = run["streams"]
+            if args.concurrency == 1:
+                result["stream"] = {
+                    **streams[0],
+                    "client_cpu_seconds": run["client_cpu_seconds"],
+                    "client_peak_rss_bytes": run["client_peak_rss_bytes"],
+                }
+            reference = streams[0]
+            if args.compare_stream:
+                previous = json.loads(args.compare_stream.read_text())
+                reference = (
+                    previous["stream"]
+                    if "stream" in previous
+                    else previous["concurrent_export"]["streams"][0]
+                )
+            for i, stream in enumerate(streams, 1):
+                _require(
+                    all(reference[k] == stream[k] for k in ("rows", "bytes", "sha256")),
+                    f"Export {i} differs from the reference export",
+                )
         if not args.stream_only:
             result["pages"] = []
             for position in dict.fromkeys(
@@ -182,12 +234,6 @@ async def measure(args: argparse.Namespace) -> dict:
                         "median_seconds": {param: median(v) for param, v in durations.items()},
                     }
                 )
-    if args.compare_stream:
-        previous = json.loads(args.compare_stream.read_text())["stream"]
-        _require(
-            all(previous[k] == result["stream"][k] for k in ("rows", "bytes", "sha256")),
-            "Export differs from baseline",
-        )
     return result
 
 
@@ -205,6 +251,7 @@ def main() -> None:
     read.add_argument("--expected-rows", type=int, default=_DEFAULT_ROWS)
     read.add_argument("--page-limit", type=int, default=1000)
     read.add_argument("--page-repeats", type=int, default=3)
+    read.add_argument("--concurrency", type=int, default=1, help="Concurrent full exports")
     read.add_argument("--timeout", type=float, default=120)
     read.add_argument("--keyset", action="store_true")
     read.add_argument("--compare-stream", type=Path, help="Verify bytes and SHA-256 against a run")
@@ -224,6 +271,10 @@ def main() -> None:
             parser.error("positive row and repeat counts and a page limit of 1-1000 required")
         if args.pages_only and args.compare_stream:
             parser.error("--compare-stream requires a stream run")
+        if args.concurrency < 1 or (args.concurrency > 1 and not args.stream_only):
+            parser.error(
+                "--concurrency requires a positive integer; above 1 requires --stream-only"
+            )
         report = asyncio.run(measure(args))
     data = json.dumps(report, indent=2) + "\n"
     if getattr(args, "output", None):

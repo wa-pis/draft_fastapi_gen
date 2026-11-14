@@ -1,0 +1,347 @@
+{
+  "benchmark_date_local": "2026-11-14",
+  "api_git_commit": "262770f09c30475649fb82c760bdb711371b8c0d",
+  "api_image_id": "sha256:1eb3e9a776c993f11d88c930a9266b61d675331bc7f9b5cdf8d4c5f1dc0eeffc",
+  "read_load_py_sha256": "dbfc6784f1764bdc3c4400c6f885e9f1a123ad6dcf0a1857bef90d562dc4d27f",
+  "environment": "Apple M4 Max, Colima 0.9.1 (VZ Linux arm64, 6 vCPU, 8 GiB), Docker Compose 5.7.0; one Uvicorn worker; local plain HTTP/1.1 without compression; one host Python 3.13.14 client process per scenario.",
+  "postgres_image": "postgres@sha256:ff87138949ad9a46f32ff23bd6852b52ce024a13dffe9b4087be98292cdd3b4f",
+  "postgres_settings": {
+    "wal_buffers": "64MB",
+    "max_wal_size": "4GB",
+    "shared_buffers": "128MB",
+    "track_io_timing": true,
+    "fsync": true,
+    "full_page_writes": true,
+    "synchronous_commit": true
+  },
+  "limits": {
+    "ndjson_chunk_bytes": 131072,
+    "postgres_cursor_prefetch_rows": 8,
+    "postgres_application_pool_max": 4,
+    "postgres_application_role_connection_limit": 4
+  },
+  "fixture": {
+    "upload_id": "90000000-0000-4000-8000-000000000001",
+    "seeded_rows": 9000000,
+    "fixture": "deterministic JSONB via SQL generate_series (synthetic receipt)",
+    "seed_sql_sha256": "4e5764600f189bb707fa0eb4b50523c41bdff00606ebd40933f77f38fe6dbb16",
+    "postgres_version": "17.11 (Debian 17.11-1.pgdg13+2)",
+    "rows_relation_bytes": 3086016512
+  },
+  "reference_export": {
+    "rows": 9000000,
+    "bytes": 2341158725,
+    "sha256": "4b970bbbd31fd195642cf6ac2ed5e12864aa108b57db05b76bcd9f976d9b2f8f"
+  },
+  "execution_order": [
+    "single-start",
+    "two",
+    "four",
+    "single-end"
+  ],
+  "method": {
+    "workload": "All requests reread the same committed upload. PostgreSQL was restarted once after seeding/checkpointing. One shared volume and PostgreSQL instance throughout; OS caches were not cleared; fresh API container per scenario.",
+    "timing": "HTTP readiness and receipt checks outside the timer. Barrier releases all requests together; group time ends when the last response completes. Client checks the row count, byte count and hash without storing or parsing the JSON bodies.",
+    "cpu": "Seconds from the change in each Docker cgroup usage_usec or Python process_time for the client, divided by group wall time for average cores. Docker counters bracket the client invocation and include measurement overhead and incidental database activity.",
+    "memory": "API PID 1 VmHWM, client process ru_maxrss, and samples about every 0.5 s of PostgreSQL container memory.current (includes page cache charged to the container cgroup) and sum of RssAnon for application-role PostgreSQL backends (avoids summing shared RSS). Active backend samples are process titles other than idle, including idle in transaction between cursor fetches.",
+    "postgres_io": "pg_stat_database deltas include diagnostics and background activity. Buffer misses may be served from the OS page cache."
+  },
+  "single_run_comparison_median": {
+    "mib_per_second": 25.201811415538195,
+    "rows_per_second": 101588.21310235359,
+    "last_completion_seconds": 88.59383656247519,
+    "median_stream_seconds": 88.59373166644946,
+    "median_stream_ttfb_ms": 69.25804144702852,
+    "api_cpu_seconds": 42.948017500000006,
+    "postgres_cpu_seconds": 35.055015999999995,
+    "client_cpu_seconds": 4.902221,
+    "api_avg_cores": 0.4847628468485522,
+    "postgres_avg_cores": 0.3956849747702995,
+    "client_avg_cores": 0.055327572223954326,
+    "api_and_postgres_cpu_seconds_per_export": 78.0030335,
+    "api_peak_rss_mib": 54.091796875,
+    "postgres_export_backends_sampled_peak_rss_anon_mib": 25.724609375,
+    "postgres_container_sampled_peak_memory_mib": 309.564453125,
+    "client_peak_rss_mib": 45.03125
+  },
+  "run_comparisons": {
+    "single-start": {
+      "mib_per_second": 25.122316943894347,
+      "rows_per_second": 101267.77179785135,
+      "last_completion_seconds": 88.87328949989751,
+      "median_stream_seconds": 88.87317024962977,
+      "median_stream_ttfb_ms": 80.08987503126264,
+      "api_cpu_seconds": 43.405925,
+      "postgres_cpu_seconds": 35.091412,
+      "client_cpu_seconds": 5.088594,
+      "api_avg_cores": 0.4884023675082946,
+      "postgres_avg_cores": 0.39484767805337584,
+      "client_avg_cores": 0.05725673066265729,
+      "api_and_postgres_cpu_seconds_per_export": 78.497337,
+      "api_peak_rss_mib": 54.01953125,
+      "postgres_export_backends_sampled_peak_rss_anon_mib": 25.73046875,
+      "postgres_container_sampled_peak_memory_mib": 297.88671875,
+      "client_peak_rss_mib": 45.078125
+    },
+    "two": {
+      "mib_per_second": 51.00941713445619,
+      "rows_per_second": 205618.37610161005,
+      "last_completion_seconds": 87.54081391589716,
+      "median_stream_seconds": 87.53174954187125,
+      "median_stream_ttfb_ms": 60.729063116014004,
+      "api_cpu_seconds": 69.404331,
+      "postgres_cpu_seconds": 64.56885,
+      "client_cpu_seconds": 10.229144999999999,
+      "api_avg_cores": 0.7928225463688129,
+      "postgres_avg_cores": 0.7375856713193579,
+      "client_avg_cores": 0.1168500102115502,
+      "api_and_postgres_cpu_seconds_per_export": 66.9865905,
+      "api_peak_rss_mib": 55.2734375,
+      "postgres_export_backends_sampled_peak_rss_anon_mib": 51.40234375,
+      "postgres_container_sampled_peak_memory_mib": 323.00390625,
+      "client_peak_rss_mib": 45.734375
+    },
+    "four": {
+      "mib_per_second": 78.93890496666943,
+      "rows_per_second": 318201.8215911325,
+      "last_completion_seconds": 113.13574454095215,
+      "median_stream_seconds": 113.1333037710283,
+      "median_stream_ttfb_ms": 86.50539582595229,
+      "api_cpu_seconds": 112.995384,
+      "postgres_cpu_seconds": 129.52704,
+      "client_cpu_seconds": 20.457075,
+      "api_avg_cores": 0.9987593616719308,
+      "postgres_avg_cores": 1.1448816687029857,
+      "client_avg_cores": 0.1808188480396227,
+      "api_and_postgres_cpu_seconds_per_export": 60.630606,
+      "api_peak_rss_mib": 56.375,
+      "postgres_export_backends_sampled_peak_rss_anon_mib": 102.69921875,
+      "postgres_container_sampled_peak_memory_mib": 396.5,
+      "client_peak_rss_mib": 46.875
+    },
+    "single-end": {
+      "mib_per_second": 25.281305887182047,
+      "rows_per_second": 101908.65440685583,
+      "last_completion_seconds": 88.31438362505287,
+      "median_stream_seconds": 88.31429308326915,
+      "median_stream_ttfb_ms": 58.4262078627944,
+      "api_cpu_seconds": 42.49011,
+      "postgres_cpu_seconds": 35.01862,
+      "client_cpu_seconds": 4.715848,
+      "api_avg_cores": 0.4811233261888099,
+      "postgres_avg_cores": 0.39652227148722324,
+      "client_avg_cores": 0.05339841378525136,
+      "api_and_postgres_cpu_seconds_per_export": 77.50873,
+      "api_peak_rss_mib": 54.1640625,
+      "postgres_export_backends_sampled_peak_rss_anon_mib": 25.71875,
+      "postgres_container_sampled_peak_memory_mib": 321.2421875,
+      "client_peak_rss_mib": 44.984375
+    }
+  },
+  "throughput_vs_single": {
+    "two": 2.024037728613678,
+    "four": 3.1322710762766675
+  },
+  "runs": {
+    "single-start": {
+      "concurrency": 1,
+      "seconds": 88.87328949989751,
+      "rows": 9000000,
+      "bytes": 2341158725,
+      "rows_per_second": 101267.77179785135,
+      "mib_per_second": 25.122316943894347,
+      "client_cpu_seconds": 5.088594,
+      "client_peak_rss_bytes": 47267840,
+      "streams": [
+        {
+          "seconds": 88.87317024962977,
+          "ttfb_seconds": 0.08008987503126264,
+          "rows": 9000000,
+          "bytes": 2341158725,
+          "sha256": "4b970bbbd31fd195642cf6ac2ed5e12864aa108b57db05b76bcd9f976d9b2f8f",
+          "rows_per_second": 101267.90767923003,
+          "mib_per_second": 25.1223506530893
+        }
+      ],
+      "server": {
+        "api_cpu_seconds": 43.405925,
+        "postgres_cpu_seconds": 35.091412,
+        "api_peak_rss_bytes": 56643584,
+        "postgres_export_backends_sampled_peak_rss_anon_bytes": 26980352,
+        "postgres_container_sampled_peak_memory_bytes": 312356864,
+        "postgres_container_first_sample_memory_bytes": 91271168,
+        "postgres_sampled_peak_application_connections": 1,
+        "postgres_sampled_peak_nonidle_connections": 1,
+        "postgres_nonidle_connections_sample_counts": {
+          "0": 3,
+          "1": 176
+        },
+        "postgres_database_stats_delta": {
+          "shared_buffer_hits": 516,
+          "shared_buffer_misses": 376473,
+          "block_read_ms": 357.365,
+          "temp_bytes": 0
+        }
+      }
+    },
+    "two": {
+      "concurrency": 2,
+      "seconds": 87.54081391589716,
+      "rows": 18000000,
+      "bytes": 4682317450,
+      "rows_per_second": 205618.37610161005,
+      "mib_per_second": 51.00941713445619,
+      "client_cpu_seconds": 10.229144999999999,
+      "client_peak_rss_bytes": 47955968,
+      "streams": [
+        {
+          "seconds": 87.52276991680264,
+          "ttfb_seconds": 0.06349091697484255,
+          "rows": 9000000,
+          "bytes": 2341158725,
+          "sha256": "4b970bbbd31fd195642cf6ac2ed5e12864aa108b57db05b76bcd9f976d9b2f8f",
+          "rows_per_second": 102830.3835511058,
+          "mib_per_second": 25.509966706781157
+        },
+        {
+          "seconds": 87.54072916693985,
+          "ttfb_seconds": 0.05796720925718546,
+          "rows": 9000000,
+          "bytes": 2341158725,
+          "sha256": "4b970bbbd31fd195642cf6ac2ed5e12864aa108b57db05b76bcd9f976d9b2f8f",
+          "rows_per_second": 102809.28758129296,
+          "mib_per_second": 25.504733258562954
+        }
+      ],
+      "server": {
+        "api_cpu_seconds": 69.404331,
+        "postgres_cpu_seconds": 64.56885,
+        "api_peak_rss_bytes": 57958400,
+        "postgres_export_backends_sampled_peak_rss_anon_bytes": 53899264,
+        "postgres_container_sampled_peak_memory_bytes": 338694144,
+        "postgres_container_first_sample_memory_bytes": 287150080,
+        "postgres_sampled_peak_application_connections": 2,
+        "postgres_sampled_peak_nonidle_connections": 2,
+        "postgres_nonidle_connections_sample_counts": {
+          "0": 2,
+          "2": 173
+        },
+        "postgres_database_stats_delta": {
+          "shared_buffer_hits": 709646,
+          "shared_buffer_misses": 708743,
+          "block_read_ms": 546.904,
+          "temp_bytes": 0
+        }
+      }
+    },
+    "four": {
+      "concurrency": 4,
+      "seconds": 113.13574454095215,
+      "rows": 36000000,
+      "bytes": 9364634900,
+      "rows_per_second": 318201.8215911325,
+      "mib_per_second": 78.93890496666943,
+      "client_cpu_seconds": 20.457075,
+      "client_peak_rss_bytes": 49152000,
+      "streams": [
+        {
+          "seconds": 113.13191983290017,
+          "ttfb_seconds": 0.08649604162201285,
+          "rows": 9000000,
+          "bytes": 2341158725,
+          "sha256": "4b970bbbd31fd195642cf6ac2ed5e12864aa108b57db05b76bcd9f976d9b2f8f",
+          "rows_per_second": 79553.14480027668,
+          "mib_per_second": 19.735393423542035
+        },
+        {
+          "seconds": 113.13057929091156,
+          "ttfb_seconds": 0.08699970785528421,
+          "rows": 9000000,
+          "bytes": 2341158725,
+          "sha256": "4b970bbbd31fd195642cf6ac2ed5e12864aa108b57db05b76bcd9f976d9b2f8f",
+          "rows_per_second": 79554.08746610231,
+          "mib_per_second": 19.73562727829388
+        },
+        {
+          "seconds": 113.13468770915642,
+          "ttfb_seconds": 0.08651475002989173,
+          "rows": 9000000,
+          "bytes": 2341158725,
+          "sha256": "4b970bbbd31fd195642cf6ac2ed5e12864aa108b57db05b76bcd9f976d9b2f8f",
+          "rows_per_second": 79551.19850718955,
+          "mib_per_second": 19.734910590840848
+        },
+        {
+          "seconds": 113.13565958337858,
+          "ttfb_seconds": 0.05795445805415511,
+          "rows": 9000000,
+          "bytes": 2341158725,
+          "sha256": "4b970bbbd31fd195642cf6ac2ed5e12864aa108b57db05b76bcd9f976d9b2f8f",
+          "rows_per_second": 79550.51513503742,
+          "mib_per_second": 19.734741061172212
+        }
+      ],
+      "server": {
+        "api_cpu_seconds": 112.995384,
+        "postgres_cpu_seconds": 129.52704,
+        "api_peak_rss_bytes": 59113472,
+        "postgres_export_backends_sampled_peak_rss_anon_bytes": 107687936,
+        "postgres_container_sampled_peak_memory_bytes": 415760384,
+        "postgres_container_first_sample_memory_bytes": 285495296,
+        "postgres_sampled_peak_application_connections": 4,
+        "postgres_sampled_peak_nonidle_connections": 4,
+        "postgres_nonidle_connections_sample_counts": {
+          "0": 3,
+          "4": 222
+        },
+        "postgres_database_stats_delta": {
+          "shared_buffer_hits": 1130612,
+          "shared_buffer_misses": 376787,
+          "block_read_ms": 596.402,
+          "temp_bytes": 0
+        }
+      }
+    },
+    "single-end": {
+      "concurrency": 1,
+      "seconds": 88.31438362505287,
+      "rows": 9000000,
+      "bytes": 2341158725,
+      "rows_per_second": 101908.65440685583,
+      "mib_per_second": 25.281305887182047,
+      "client_cpu_seconds": 4.715848,
+      "client_peak_rss_bytes": 47169536,
+      "streams": [
+        {
+          "seconds": 88.31429308326915,
+          "ttfb_seconds": 0.0584262078627944,
+          "rows": 9000000,
+          "bytes": 2341158725,
+          "sha256": "4b970bbbd31fd195642cf6ac2ed5e12864aa108b57db05b76bcd9f976d9b2f8f",
+          "rows_per_second": 101908.75888588208,
+          "mib_per_second": 25.281331806140912
+        }
+      ],
+      "server": {
+        "api_cpu_seconds": 42.49011,
+        "postgres_cpu_seconds": 35.01862,
+        "api_peak_rss_bytes": 56795136,
+        "postgres_export_backends_sampled_peak_rss_anon_bytes": 26968064,
+        "postgres_container_sampled_peak_memory_bytes": 336846848,
+        "postgres_container_first_sample_memory_bytes": 311377920,
+        "postgres_sampled_peak_application_connections": 1,
+        "postgres_sampled_peak_nonidle_connections": 1,
+        "postgres_nonidle_connections_sample_counts": {
+          "0": 2,
+          "1": 175
+        },
+        "postgres_database_stats_delta": {
+          "shared_buffer_hits": 607,
+          "shared_buffer_misses": 376456,
+          "block_read_ms": 442.27099999999996,
+          "temp_bytes": 0
+        }
+      }
+    }
+  }
+}

@@ -140,6 +140,86 @@ API и PostgreSQL измеряйте суммарные секунды CPU за 
 оставляя тот же том PostgreSQL. В [замере на 9 млн строк](../VALIDATION.md#чтение-9-млн-строк-after_row_number-и-порции-ndjson-по-128-киб)
 порядок версий был A–B–B–A.
 
+### Параллельные выгрузки: 1, 2 и 4 читателя
+
+В отдельном проекте Docker Compose поднимите PostgreSQL 17 с `wal_buffers=64MB`.
+Сервис запускайте с одним воркером Uvicorn и `WRITER_POOL_SIZE=4`; для
+отдельной роли приложения без прав суперпользователя задайте `CONNECTION LIMIT 4`.
+Оставьте порции NDJSON до 128 КиБ. Используйте одну подготовленную выше загрузку
+на 9 млн строк во всех запросах. Между сценариями запускайте свежий контейнер
+приложения, оставляя тот же том PostgreSQL. На стенде не должно быть других
+читателей или писателей.
+
+Запускайте из `async-postgres-writer` в Bash. Экспортируйте `POSTGRES_PASSWORD`,
+`READ_PASSWORD` и `WRITER_API_TOKEN` как случайные hex-строки по 48 символов.
+Добавьте временные настройки к основному Compose-файлу и тестовой публикации
+портов:
+
+```bash
+overlay=$(mktemp)
+cat > "$overlay" <<'YAML'
+services:
+  postgres:
+    command:
+      [postgres, -c, wal_buffers=64MB, -c, max_wal_size=4GB, -c, track_io_timing=on,
+       -c, fsync=on, -c, full_page_writes=on, -c, synchronous_commit=on]
+  writer:
+    environment:
+      WRITER_POOL_SIZE: "4"
+      WRITER_DATABASE_URL: postgresql://read_api:${READ_PASSWORD:?}@postgres:5432/stream_writer
+YAML
+project="pg17-read-bench-$$"
+c=(docker compose -p "$project" -f compose.yaml -f benchmarks/compose.override.yaml -f "$overlay")
+"${c[@]}" up -d --wait postgres
+"${c[@]}" run --rm --build init-db
+"${c[@]}" exec -T postgres psql -U writer -d stream_writer -v ON_ERROR_STOP=1 -v read_password="$READ_PASSWORD" <<'SQL'
+CREATE ROLE read_api LOGIN CONNECTION LIMIT 4 PASSWORD :'read_password';
+GRANT USAGE ON SCHEMA stream_writer TO read_api;
+GRANT SELECT ON ALL TABLES IN SCHEMA stream_writer TO read_api;
+SQL
+pg_addr=$("${c[@]}" port postgres 5432)
+export WRITER_TEST_DATABASE_URL="postgresql://writer:$POSTGRES_PASSWORD@$pg_addr/stream_writer"
+upload_id=90000000-0000-4000-8000-000000000001
+.venv/bin/python benchmarks/read_load.py seed --upload-id "$upload_id"
+"${c[@]}" exec -T postgres psql -U writer -d stream_writer -c CHECKPOINT
+```
+
+Сделайте прогоны в порядке `1 → 2 → 4 → 1`; повтор одиночной выгрузки покажет,
+насколько она изменилась за время теста. В замере PostgreSQL один раз перезапускали
+после наполнения базы и `CHECKPOINT`, а кэш ОС не сбрасывали. Чтобы убрать
+периодические подключения `pg_isready` из замера, после подготовки можно
+отключить Compose healthcheck для PostgreSQL, пересоздать только его контейнер с
+тем же томом и подтвердить готовность вручную до первого прогона. Перед каждым
+прогоном:
+
+```bash
+readers=1  # затем 2, 4, 1
+label=readers-1-start  # затем readers-2, readers-4, readers-1-end
+"${c[@]}" up -d --wait --no-build --no-deps --force-recreate writer
+BASE_URL="http://$("${c[@]}" port writer 8080)"
+compare=()
+if [ "$label" != readers-1-start ]; then
+  compare=(--compare-stream /tmp/readers-1-start.json)
+fi
+.venv/bin/python benchmarks/read_load.py measure --url "$BASE_URL" \
+  --upload-id "$upload_id" --label "$label" --stream-only --concurrency "$readers" \
+  "${compare[@]}" --output "/tmp/$label.json"
+```
+
+Каждый запрос вычитывает все 9 млн строк. Клиент считает строки, байты и SHA-256
+на лету, без записи тела; `--compare-stream` сверяет каждый ответ с одиночным.
+Отчёт показывает суммарную скорость (все байты до завершения последнего ответа)
+и время каждого запроса. CPU приложения и PostgreSQL измеряйте по дельте
+`usage_usec` контейнеров; память приложения — по `VmHWM` процесса. Для PostgreSQL
+снимайте `memory.current` контейнера (включает кеш страниц), число серверных
+процессов роли приложения и максимум их суммарного `RssAnon` по снимкам `/proc`.
+Это не требует дополнительных подключений к базе. Полный RSS этих процессов
+не складывайте: общая память PostgreSQL будет посчитана несколько раз.
+[Описание счётчиков cgroup v2](https://docs.kernel.org/admin-guide/cgroup-v2.html).
+
+Чтобы удалить выделенный стенд после прогона, выполните
+`"${c[@]}" down --volumes` и `rm "$overlay"`.
+
 ## Через Docker Compose с PostgreSQL 17
 
 Запустите Docker и [Compose 2.24.4+](https://docs.docker.com/reference/compose-file/merge/#replace-value)
