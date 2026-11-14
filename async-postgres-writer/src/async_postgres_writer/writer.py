@@ -22,7 +22,7 @@ _EXPORT_ROWS_AFTER = (
     "WHERE upload_id = $1 AND row_number > $2 ORDER BY row_number LIMIT $3"
 )
 _READ_ERRORS = (asyncpg.PostgresError, asyncpg.InterfaceError, OSError, TimeoutError)
-_EXPORT_PREFETCH = 8
+_PAGE_PREFETCH = 8
 MAX_PAGE_BYTES = 16 * 1024**2
 
 
@@ -100,7 +100,7 @@ class Store:
                 bounds = (after_row_number, limit + 1)
             size = 0
             last_row_number = None
-            async for row in conn.cursor(query, upload_id, *bounds, prefetch=_EXPORT_PREFETCH):
+            async for row in conn.cursor(query, upload_id, *bounds, prefetch=_PAGE_PREFETCH):
                 if len(records) == limit:
                     return total, records, last_row_number
                 record = row[0].encode("utf-8")
@@ -117,7 +117,9 @@ class Store:
     @asynccontextmanager
     async def stream_rows(self, upload_id: UUID) -> AsyncIterator[tuple[int, AsyncIterator[str]]]:
         async with self._committed_read(upload_id) as (conn, total):
-            cursor = conn.cursor(_EXPORT_ROWS, upload_id, prefetch=_EXPORT_PREFETCH)
+            cursor = conn.cursor(
+                _EXPORT_ROWS, upload_id, prefetch=self.settings.export_prefetch_rows
+            )
             yield total, (row[0] async for row in cursor)
 
     async def write(self, upload_id: UUID, chunks: AsyncIterable[bytes]) -> Receipt:

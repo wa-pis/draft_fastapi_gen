@@ -56,10 +56,12 @@ def decode_json(raw):
 
 
 async def test_pages_and_ndjson_export_match_committed_rows_in_order(read_api):
-    client, _, upload_id, other_id = read_api
+    client, app, upload_id, other_id = read_api
     upload_path = f"/v1/uploads/{upload_id}"
     high_precision = Decimal("123.4567890123456789012345")
     rows = [{"index": index, "text": 'Привет\n"мир"'} for index in range(1, 131)]
+    # Export row 32 is last in the first 32-row fetch and spans multiple HTTP chunks.
+    rows[30]["text"] += "я" * (64 * 1024)
     numeric_row = b'{"decimal":123.4567890123456789012345,"exponent":1e400}\n'
     body = numeric_row + b"".join(
         json.dumps(row, ensure_ascii=False).encode() + b"\n" for row in rows
@@ -108,11 +110,19 @@ async def test_pages_and_ndjson_export_match_committed_rows_in_order(read_api):
     assert past_end.json()["row_count"] == len(expected)
     assert past_end.json()["rows"] == []
 
-    async with client.stream("GET", f"{upload_path}/rows/stream", headers=AUTH) as exported:
-        assert exported.status_code == 200
-        assert exported.headers["Content-Type"].split(";")[0] == "application/x-ndjson"
-        assert exported.headers["X-Row-Count"] == str(len(expected))
-        assert [decode_json(line) async for line in exported.aiter_lines()] == expected
+    app.state.store.settings.export_prefetch_rows = 8
+    baseline = await client.get(f"{upload_path}/rows/stream", headers=AUTH)
+    assert baseline.status_code == 200
+    assert baseline.headers["Content-Type"].split(";")[0] == "application/x-ndjson"
+    assert baseline.headers["X-Row-Count"] == str(len(expected))
+    assert baseline.content.endswith(b"\n")
+    assert [decode_json(line) for line in baseline.content.splitlines()] == expected
+
+    app.state.store.settings.export_prefetch_rows = 32
+    tuned = await client.get(f"{upload_path}/rows/stream", headers=AUTH)
+    assert tuned.status_code == 200
+    assert tuned.headers == baseline.headers
+    assert tuned.content == baseline.content
 
 
 async def test_keyset_handles_row_number_gaps_and_an_exact_final_page(read_api):
