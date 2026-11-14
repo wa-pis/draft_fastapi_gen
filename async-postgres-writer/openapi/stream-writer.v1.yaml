@@ -1,0 +1,376 @@
+openapi: 3.1.0
+info:
+  title: Async PostgreSQL Stream Writer
+  version: 1.0.0
+  description: Потоковая загрузка, квитанции и чтение подтверждённых результатов.
+security:
+  - bearerAuth: []
+paths:
+  /health/live:
+    get:
+      operationId: checkLiveness
+      summary: Проверить, что процесс запущен
+      security: []
+      responses:
+        '200':
+          $ref: '#/components/responses/Health'
+  /health/ready:
+    get:
+      operationId: checkReadiness
+      summary: Проверить доступность схемы PostgreSQL
+      responses:
+        '200':
+          $ref: '#/components/responses/Health'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '503':
+          $ref: '#/components/responses/DatabaseUnavailable'
+  /v1/uploads/{upload_id}:
+    parameters:
+      - $ref: '#/components/parameters/UploadId'
+    put:
+      operationId: uploadNdjson
+      summary: Потоково загрузить строки
+      description: |
+        Один JSON-объект UTF-8 на строку; последняя строка может не заканчиваться LF.
+        Сжатие тела не поддерживается. Ответ об успехе выдаётся после commit.
+        При неизвестном исходе проверьте квитанцию по исходному UUID: отсутствие
+        квитанции ещё не означает, что загрузка завершилась неудачей.
+      requestBody:
+        required: true
+        content:
+          application/x-ndjson:
+            example: |
+              {"price":1.25}
+              {"price":2.50}
+      responses:
+        '200':
+          description: Точный повтор, данные уже сохранены.
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/UploadReceipt'
+                  - properties:
+                      reused: {const: true}
+        '201':
+          description: Запись нового результата подтверждена.
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/UploadReceipt'
+                  - properties:
+                      reused: {const: false}
+        '400':
+          description: Некорректное тело или заголовок Content-Length.
+          content:
+            application/json:
+              schema:
+                oneOf:
+                  - $ref: '#/components/schemas/DetailError'
+                  - $ref: '#/components/schemas/WriterError'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '408':
+          description: Истёк таймаут чтения тела или загрузки.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/WriterError'}
+        '409':
+          description: Загрузка с этим UUID ещё выполняется или её байты отличаются.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/WriterError'}
+              examples:
+                inProgress:
+                  value: {error: upload_in_progress, message: Upload is in progress}
+                changedBody:
+                  value: {error: upload_conflict, message: Upload ID has other data}
+        '413':
+          description: Превышен лимит размера тела или строки.
+          content:
+            application/json:
+              schema:
+                oneOf:
+                  - $ref: '#/components/schemas/DetailError'
+                  - $ref: '#/components/schemas/WriterError'
+        '415':
+          description: Неподдерживаемый тип, кодировка или сжатие тела.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/DetailError'}
+        '422':
+          $ref: '#/components/responses/ValidationFailed'
+        '503':
+          description: Ошибка PostgreSQL или неизвестный исход commit (commit_unknown).
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/WriterError'}
+    get:
+      operationId: getUploadReceipt
+      summary: Получить квитанцию подтверждённой загрузки
+      responses:
+        '200':
+          description: Квитанция подтверждённой загрузки.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/UploadReceipt'}
+              example:
+                upload_id: 00000000-0000-0000-0000-000000000001
+                sha256: '3722b03421837ab0961deeb09decee7269f81a98c0e923d00a17c21d245019d2'
+                row_count: 2
+                byte_count: 30
+                committed_at: '2026-11-14T12:00:00Z'
+                reused: false
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          description: Подтверждённой квитанции ещё нет или UUID неизвестен.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/DetailError'}
+        '422':
+          $ref: '#/components/responses/ValidationFailed'
+        '503':
+          $ref: '#/components/responses/DatabaseUnavailable'
+  /v1/uploads/{upload_id}/rows:
+    parameters:
+      - $ref: '#/components/parameters/UploadId'
+    get:
+      operationId: listUploadRows
+      summary: Прочитать страницу подтверждённых строк
+      description: |
+        Строки возвращаются по возрастанию row_number. Параметры offset и
+        after_row_number взаимоисключающие, в том числе при offset=0.
+        Без позиции используется offset=0. Размер JSON-ответа ограничен 16 МиБ.
+      parameters:
+        - name: limit
+          in: query
+          schema: {type: integer, minimum: 1, maximum: 1000, default: 100}
+        - name: offset
+          in: query
+          schema: {$ref: '#/components/schemas/Position'}
+        - name: after_row_number
+          in: query
+          description: Вернуть строки с row_number строго больше указанного значения.
+          schema: {$ref: '#/components/schemas/Position'}
+      responses:
+        '200':
+          description: Страница строк; за пределами результата rows пуст.
+          headers:
+            Cache-Control:
+              $ref: '#/components/headers/NoStore'
+          content:
+            application/json:
+              schema:
+                oneOf:
+                  - $ref: '#/components/schemas/OffsetPage'
+                  - $ref: '#/components/schemas/CursorPage'
+              examples:
+                offset:
+                  value:
+                    upload_id: 00000000-0000-0000-0000-000000000001
+                    row_count: 2
+                    limit: 1
+                    offset: 0
+                    rows: [{row_number: 1, data: {price: 1.25}}]
+                cursor:
+                  value:
+                    upload_id: 00000000-0000-0000-0000-000000000001
+                    row_count: 2
+                    limit: 1
+                    after_row_number: 1
+                    next_after_row_number: null
+                    rows: [{row_number: 2, data: {price: 2.50}}]
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/UploadNotFound'
+        '413':
+          description: Страница превышает лимит (page_too_large).
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/WriterError'}
+        '422':
+          description: Неверный UUID или query; одновременно заданные позиции возвращают detail строкой.
+          content:
+            application/json:
+              schema:
+                oneOf:
+                  - $ref: '#/components/schemas/ValidationError'
+                  - $ref: '#/components/schemas/DetailError'
+        '503':
+          $ref: '#/components/responses/DatabaseUnavailable'
+  /v1/uploads/{upload_id}/rows/stream:
+    parameters:
+      - $ref: '#/components/parameters/UploadId'
+    get:
+      operationId: streamUploadRows
+      summary: Потоково выгрузить все подтверждённые строки
+      description: |
+        UTF-8 NDJSON по возрастанию row_number. Каждая строка — объект
+        ResultRow, завершаемый LF. Порции отправки приложения не больше
+        128 КиБ; запись или символ UTF-8 могут пересекать границы порций.
+        HTTP 200 не подтверждает полноту: проверьте штатное завершение тела
+        и число строк из X-Row-Count. Ошибка после заголовков прерывает поток.
+        SHA-256 квитанции относится к исходному PUT, а не к этому ответу.
+      responses:
+        '200':
+          description: Поток записей ResultRow.
+          headers:
+            Cache-Control:
+              $ref: '#/components/headers/NoStore'
+            X-Row-Count:
+              required: true
+              description: Ожидаемое число строк в полном ответе.
+              schema: {$ref: '#/components/schemas/Position'}
+          content:
+            application/x-ndjson:
+              example: |
+                {"row_number":1,"data":{"price":1.25}}
+                {"row_number":2,"data":{"price":2.50}}
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/UploadNotFound'
+        '422':
+          $ref: '#/components/responses/ValidationFailed'
+        '503':
+          description: Ошибка PostgreSQL или таймаут до начала ответа.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/WriterError'}
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+  parameters:
+    UploadId:
+      name: upload_id
+      in: path
+      required: true
+      schema: {type: string, format: uuid}
+  headers:
+    NoStore:
+      required: true
+      schema: {type: string, const: no-store}
+  responses:
+    Health:
+      description: Проверка прошла.
+      content:
+        application/json:
+          schema:
+            type: object
+            required: [status]
+            properties:
+              status: {const: ok}
+    Unauthorized:
+      description: Отсутствует действительный Bearer token.
+      headers:
+        WWW-Authenticate:
+          required: true
+          schema: {type: string, const: Bearer}
+      content:
+        application/json:
+          schema: {$ref: '#/components/schemas/DetailError'}
+    ValidationFailed:
+      description: Ошибка валидации UUID.
+      content:
+        application/json:
+          schema: {$ref: '#/components/schemas/ValidationError'}
+    DatabaseUnavailable:
+      description: Ошибка PostgreSQL.
+      content:
+        application/json:
+          schema: {$ref: '#/components/schemas/WriterError'}
+    UploadNotFound:
+      description: Загрузка неизвестна или ещё не подтверждена (upload_not_found).
+      content:
+        application/json:
+          schema: {$ref: '#/components/schemas/WriterError'}
+  schemas:
+    Position:
+      type: integer
+      format: int64
+      minimum: 0
+      maximum: 9223372036854775807
+    RowNumber:
+      type: integer
+      format: int64
+      minimum: 1
+      maximum: 9223372036854775807
+    UploadReceipt:
+      type: object
+      required: [upload_id, sha256, row_count, byte_count, committed_at, reused]
+      properties:
+        upload_id: {type: string, format: uuid}
+        sha256: {type: string, pattern: '^[a-f0-9]{64}$'}
+        row_count: {$ref: '#/components/schemas/Position'}
+        byte_count: {$ref: '#/components/schemas/Position'}
+        committed_at: {type: string, format: date-time}
+        reused: {type: boolean}
+    ResultRow:
+      type: object
+      required: [row_number, data]
+      properties:
+        row_number: {$ref: '#/components/schemas/RowNumber'}
+        data: {type: object}
+    Page:
+      type: object
+      required: [upload_id, row_count, limit, rows]
+      properties:
+        upload_id: {type: string, format: uuid}
+        row_count: {$ref: '#/components/schemas/Position'}
+        limit: {type: integer, minimum: 1, maximum: 1000}
+        rows:
+          type: array
+          items: {$ref: '#/components/schemas/ResultRow'}
+    OffsetPage:
+      allOf:
+        - $ref: '#/components/schemas/Page'
+        - required: [offset]
+          properties:
+            offset: {$ref: '#/components/schemas/Position'}
+      unevaluatedProperties: false
+    CursorPage:
+      allOf:
+        - $ref: '#/components/schemas/Page'
+        - required: [after_row_number, next_after_row_number]
+          properties:
+            after_row_number: {$ref: '#/components/schemas/Position'}
+            next_after_row_number:
+              description: Номер последней строки страницы при наличии продолжения; иначе null.
+              anyOf:
+                - $ref: '#/components/schemas/RowNumber'
+                - type: 'null'
+      unevaluatedProperties: false
+    DetailError:
+      type: object
+      required: [detail]
+      properties:
+        detail: {type: string}
+    ValidationError:
+      type: object
+      required: [detail]
+      properties:
+        detail:
+          type: array
+          items:
+            type: object
+            required: [loc, msg, type]
+            properties:
+              loc:
+                type: array
+                items:
+                  type: [string, integer]
+              msg: {type: string}
+              type: {type: string}
+    WriterError:
+      type: object
+      required: [error, message]
+      properties:
+        error: {type: string}
+        message: {type: string}
+        upload_id: {type: string, format: uuid}

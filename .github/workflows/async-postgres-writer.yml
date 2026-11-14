@@ -3,11 +3,13 @@ name: Async PostgreSQL Writer
 on:
   pull_request:
     paths:
+      - 'async-postgres-client/**'
       - 'async-postgres-writer/**'
       - '.github/workflows/async-postgres-writer.yml'
   push:
     branches: [main, 'codex/async-db-stream-writer']
     paths:
+      - 'async-postgres-client/**'
       - 'async-postgres-writer/**'
       - '.github/workflows/async-postgres-writer.yml'
 
@@ -49,5 +51,55 @@ jobs:
       - run: uv run --locked pytest -q
       - run: uv run --locked pytest -q -m integration
       - run: uv build
+      - name: Check OpenAPI from the installed writer wheel
+        run: |
+          WRITER_DATABASE_URL="$WRITER_TEST_DATABASE_URL" \
+          WRITER_API_TOKEN=ci-token-for-postgres-stream-contract \
+          uv run --isolated --no-project --with ./dist/async_postgres_writer-*.whl --with httpx python - <<'PY'
+          import asyncio
+          import httpx
+          from async_postgres_writer.app import create_app
+
+          async def main():
+              async with httpx.AsyncClient(
+                  transport=httpx.ASGITransport(app=create_app()), base_url="http://test"
+              ) as http:
+                  response = await http.get("/openapi.json")
+                  response.raise_for_status()
+                  assert response.json()["info"]["version"] == "1.0.0"
+
+          asyncio.run(main())
+          PY
       - run: docker build -t async-postgres-writer:ci .
       - run: docker run --rm async-postgres-writer:ci --help
+      - name: Check client and build its wheel
+        working-directory: async-postgres-client
+        run: |
+          uv sync --locked --python 3.13
+          uv run --locked ruff check .
+          uv run --locked ruff format --check .
+          uv run --locked pytest -q
+          uv build
+      - name: Exercise installed client against the server image on PostgreSQL 17
+        working-directory: async-postgres-client
+        env:
+          WRITER_API_TOKEN: ci-token-for-postgres-stream-contract
+          WRITER_TEST_API_URL: http://127.0.0.1:18080
+        run: |
+          export WRITER_DATABASE_URL="$WRITER_TEST_DATABASE_URL"
+          docker run --rm --network host -e WRITER_DATABASE_URL -e WRITER_API_TOKEN \
+            async-postgres-writer:ci init-db
+          docker run -d --rm --name postgres-writer-e2e --network host \
+            -e WRITER_DATABASE_URL -e WRITER_API_TOKEN async-postgres-writer:ci \
+            serve --host 127.0.0.1 --port 18080
+          trap 'docker logs postgres-writer-e2e; docker rm -f postgres-writer-e2e' EXIT
+          for attempt in {1..30}; do
+            if curl -fsS -H "Authorization: Bearer $WRITER_API_TOKEN" "$WRITER_TEST_API_URL/health/ready"; then
+              break
+            fi
+            sleep 1
+          done
+          curl -fsS -H "Authorization: Bearer $WRITER_API_TOKEN" "$WRITER_TEST_API_URL/health/ready"
+          uv pip install --python .venv/bin/python --no-deps --reinstall ./dist/async_postgres_client-*.whl
+          .venv/bin/python -c 'from importlib.util import find_spec; assert all(find_spec(name) is None for name in ("asyncpg", "fastapi", "async_postgres_writer"))'
+          .venv/bin/pytest -q -m integration

@@ -256,7 +256,8 @@ WAL, лаг реплик и место под JSONB/индексы. После �
 
 ```bash
 cp .env.example .env
-docker compose up --build -d writer
+docker compose build writer
+docker compose up --no-build -d writer
 docker compose logs writer
 ```
 
@@ -267,7 +268,8 @@ docker compose logs writer
 Для загрузок 1–5 ГиБ есть отдельный профиль настроек PostgreSQL:
 
 ```bash
-docker compose -f compose.yaml -f compose.bulk.yaml up --build -d writer
+docker compose -f compose.yaml -f compose.bulk.yaml build writer
+docker compose -f compose.yaml -f compose.bulk.yaml up --no-build -d writer
 ```
 
 Он задаёт `max_wal_size=8GB` и `wal_buffers=16MB`. На локальном PostgreSQL 14 эти
@@ -316,6 +318,12 @@ SHA-256, повтор без дубликатов и сохранность по
 
 ## Документация
 
+- [Контракт OpenAPI 3.1 v1](openapi/stream-writer.v1.yaml) — исходник для
+  `GET /openapi.json` и Swagger UI на `GET /docs`. Контракт описывает Bearer,
+  статусы и модели ответа; примеры PUT, квитанции, страниц и потоковой выгрузки
+  приведены выше. Для больших ответов используйте потоковый клиент.
+- [Асинхронный Python-клиент](../async-postgres-client/README.md) — отдельный
+  пакет для работы с тем же контрактом без подключения к PostgreSQL.
 - [asyncpg: COPY и async iterable](https://magicstack.github.io/asyncpg/current/api/index.html#asyncpg.connection.Connection.copy_records_to_table)
   — передача записей без списка всего результата.
 - [PostgreSQL 17: COPY](https://www.postgresql.org/docs/17/sql-copy.html) — поток по STDIN,
@@ -325,4 +333,8 @@ SHA-256, повтор без дубликатов и сохранность по
 - [PostgreSQL 17: WAL reliability](https://www.postgresql.org/docs/17/wal-reliability.html)
   и [VACUUM](https://www.postgresql.org/docs/17/sql-vacuum.html) — серверные гарантии и обслуживание.
 
-План и требования: `openspec/changes/async-postgres-stream-writer/`.
+План и требования:
+
+- [Текущий PostgreSQL-сервис](openspec/changes/async-postgres-stream-writer/proposal.md).
+- [Сервер и версионируемый контракт OpenAPI](openspec/changes/postgres-stream-openapi-server/proposal.md).
+- [Отдельный асинхронный Python-клиент](../async-postgres-client/openspec/changes/postgres-stream-openapi-client/proposal.md).
