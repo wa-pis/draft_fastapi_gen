@@ -16,6 +16,7 @@ from .typed_data import TYPED_COLUMNS, typed_record
 
 
 class TypedStore(Store):
+    supports_result_reads = False  # This benchmark writes to a different table.
     _rows_check = f"SELECT {', '.join(TYPED_COLUMNS)} FROM stream_writer_bench.typed_rows LIMIT 0"
 
     async def _copy_rows(

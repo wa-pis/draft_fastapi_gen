@@ -55,7 +55,7 @@
 
 ### Requirement: Explicit initialization and authenticated API
 Инициализация схемы SHALL быть отдельной командой. Рабочий сервер SHALL NOT выполнять DDL.
-PUT, GET receipt и readiness SHALL требовать Bearer token; liveness SHALL быть публичным.
+PUT, GET receipt, GET данных и readiness SHALL требовать Bearer token; liveness SHALL быть публичным.
 
 #### Scenario: Request without valid token
 - **WHEN** клиент обращается к защищённому endpoint без корректного token
@@ -64,3 +64,36 @@ PUT, GET receipt и readiness SHALL требовать Bearer token; liveness SH
 #### Scenario: Start server on existing database
 - **WHEN** запускается serve
 - **THEN** сервис подключается к настроенной БД без автоматического создания базы и таблиц
+
+### Requirement: Read committed upload data by page or stream
+Сервис SHALL предоставлять чтение строк одной подтверждённой загрузки по UUID с
+сортировкой по возрастанию `row_number`. Для неподтверждённого или неизвестного
+UUID сервис SHALL возвращать `404`. API SHALL использовать существующую схему и
+помечать ответы с данными заголовком `Cache-Control: no-store`.
+
+#### Scenario: Read a page of rows
+- **WHEN** клиент запрашивает `GET /v1/uploads/{upload_id}/rows` с `limit` от 1 до 1000 и `offset` от 0 до `9223372036854775807`
+- **THEN** сервис возвращает JSON с `upload_id`, общим `row_count`, `limit`, `offset` и массивом `rows`, где каждая запись содержит `row_number` и `data`
+- **AND** при отсутствии параметров используются `limit=100` и `offset=0`
+- **AND** при смещении за пределами результата сервис возвращает `200` с пустым массивом
+
+#### Scenario: Reject invalid pagination
+- **WHEN** `limit` или `offset` не являются целыми числами допустимого диапазона
+- **THEN** сервис возвращает `422`
+
+#### Scenario: Reject an oversized page
+- **WHEN** сериализованное тело JSON-страницы превышает 16 МиБ
+- **THEN** сервис возвращает `413` и предлагает уменьшить `limit` или использовать поток
+
+#### Scenario: Stream an upload with bounded resources
+- **WHEN** клиент запрашивает `GET /v1/uploads/{upload_id}/rows/stream`
+- **THEN** сервис отдаёт `application/x-ndjson` с `X-Row-Count`, по одному объекту с `row_number` и `data` на строку, без накопления всего результата в памяти
+- **AND** сервис ограничивает общее время потоковой выгрузки, включая передачу ответа, и освобождает соединение при её завершении или прерывании
+
+#### Scenario: Database fails before streaming begins
+- **WHEN** ошибка БД произошла до отправки заголовков
+- **THEN** сервис возвращает `503`
+
+#### Scenario: Database fails after streaming begins
+- **WHEN** ошибка БД произошла после отправки заголовков потокового ответа
+- **THEN** сервис прерывает ответ без успешного завершения потока

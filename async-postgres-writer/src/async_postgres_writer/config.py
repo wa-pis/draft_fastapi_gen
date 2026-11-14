@@ -11,6 +11,7 @@ class Settings(BaseSettings):
     max_upload_bytes: int = Field(default=5 * 1024**3, ge=1)
     max_line_bytes: int = Field(default=1024**2, ge=1)
     upload_timeout_seconds: float = Field(default=3600, gt=0, allow_inf_nan=False)
+    export_timeout_seconds: float = Field(default=3600, gt=0, allow_inf_nan=False)
     read_timeout_seconds: float = Field(default=30, gt=0, allow_inf_nan=False)
     acquire_timeout_seconds: float = Field(default=5, gt=0, allow_inf_nan=False)
     db_command_timeout_seconds: float = Field(default=60, gt=0, allow_inf_nan=False)
