@@ -12,7 +12,7 @@ import random
 import shutil
 import subprocess
 import time
-from contextlib import suppress
+from contextlib import AsyncExitStack, suppress
 from decimal import Decimal
 from pathlib import Path
 from uuid import UUID, uuid4
@@ -25,6 +25,7 @@ CHUNK_BYTES = 64 * 1024
 GIB = 1024**3
 SEED = 20261108
 MONITOR_ERRORS = (asyncpg.PostgresError, asyncpg.InterfaceError, OSError)
+WORKER_PID_HEADER = "X-Benchmark-Worker-Pid"
 
 
 def activity_result() -> dict:
@@ -37,6 +38,8 @@ def activity_result() -> dict:
         "close_error": None,
         "coverage": "unavailable",
         "backend_sample_histogram": {},
+        "app_backend_histogram": {},
+        "peak_app_backends": 0,
         "active_copy_backend_histogram": {},
         "peak_active_copy_backends": 0,
         "interval_seconds": 0.5,
@@ -102,6 +105,10 @@ async def sample_activity(
             break
         else:
             result["samples"] += 1
+            backends = sum(row["backends"] for row in rows)
+            app_histogram = result["app_backend_histogram"]
+            app_histogram[str(backends)] = app_histogram.get(str(backends), 0) + 1
+            result["peak_app_backends"] = max(result["peak_app_backends"], backends)
             copies = sum(row.get("active_copies", 0) for row in rows)
             copy_histogram = result["active_copy_backend_histogram"]
             copy_histogram[str(copies)] = copy_histogram.get(str(copies), 0) + 1
@@ -164,18 +171,93 @@ def stream_label(phase: str, index: int, concurrency: int) -> str:
     return phase if concurrency == 1 else f"{phase} {index + 1}/{concurrency}"
 
 
-async def upload_batch(client, headers, upload_ids, body, total_bytes, total_rows):
+def response_worker_pid(response: httpx.Response) -> int:
+    try:
+        pid = int(response.headers[WORKER_PID_HEADER])
+    except (KeyError, ValueError) as exc:
+        raise RuntimeError(f"Missing or invalid {WORKER_PID_HEADER}") from exc
+    if pid < 1:
+        raise RuntimeError(f"Invalid {WORKER_PID_HEADER}: {pid}")
+    return pid
+
+
+async def warm_worker_clients(stack, url, headers, concurrency, worker_count):
+    per_worker = concurrency // worker_count
+    by_pid = {}
+    limits = httpx.Limits(max_connections=1, max_keepalive_connections=1, keepalive_expiry=3600)
+
+    async def probe(attempt, path):
+        candidate = await attempt.enter_async_context(
+            httpx.AsyncClient(base_url=url, timeout=3600, limits=limits)
+        )
+        response = await candidate.get(path, headers=headers, timeout=10)
+        if response.status_code != 200:
+            raise RuntimeError(f"Worker probe {path} failed: HTTP {response.status_code}")
+        if response.headers.get("Connection", "").lower() == "close":
+            raise RuntimeError(f"Worker probe {path} did not keep its HTTP connection open")
+        return response_worker_pid(response), candidate, attempt
+
+    def retain(pid, candidate, attempt):
+        clients = by_pid.setdefault(pid, [])
+        if len(by_pid) > worker_count:
+            raise RuntimeError(
+                f"Expected {worker_count} Uvicorn workers but observed {len(by_pid)}"
+            )
+        if len(clients) < per_worker:
+            clients.append(candidate)
+            stack.push_async_callback(attempt.pop_all().aclose)
+
+    def balanced():
+        if len(by_pid) == worker_count and all(
+            len(clients) == per_worker for clients in by_pid.values()
+        ):
+            # Distribute consecutive upload slots across PIDs before reusing a worker.
+            return [
+                (pid, clients[slot])
+                for slot in range(per_worker)
+                for pid, clients in by_pid.items()
+            ]
+        return None
+
+    for _ in range(max(32, 16 * concurrency)):
+        async with AsyncExitStack() as attempt:
+            retain(*(await probe(attempt, "/health/ready")))
+            if selected := balanced():
+                return selected
+    # Shared-port accept can repeatedly favor the same processes on serial connections.
+    # Probe liveness in bursts so concurrent warmup never queues checks on the DB pools.
+    for _ in range(3):
+        async with AsyncExitStack() as burst:
+            attempts = [await burst.enter_async_context(AsyncExitStack()) for _ in range(24)]
+            async with asyncio.TaskGroup() as group:
+                tasks = [group.create_task(probe(attempt, "/health/live")) for attempt in attempts]
+            for task in tasks:
+                retain(*task.result())
+            if selected := balanced():
+                return selected
+    observed = {pid: len(clients) for pid, clients in by_pid.items()}
+    raise RuntimeError(f"Could not warm {per_worker} connections per worker: {observed}")
+
+
+async def upload_batch(client, headers, upload_ids, body, total_bytes, total_rows, *, workers=None):
     async def put(index, upload_id):
         digest = hashlib.sha256()
         label = stream_label("upload", index, len(upload_ids))
+        expected_pid, target = workers[index] if workers is not None else (None, client)
         started = time.monotonic()
-        response = await client.put(
+        response = await target.put(
             f"/v1/uploads/{upload_id}", headers=headers, content=body(digest, label)
         )
         finished = time.monotonic()
         wall_finished = time.time()
         if response.status_code != 201:
             raise RuntimeError(f"{label} failed: {response.status_code} {response.text}")
+        worker = {}
+        if expected_pid is not None:
+            actual_pid = response_worker_pid(response)
+            if actual_pid != expected_pid:
+                raise RuntimeError(f"{label} expected worker {expected_pid}, got {actual_pid}")
+            worker["worker_pid"] = actual_pid
         receipt = response.json()
         assert receipt["upload_id"] == str(upload_id)
         assert receipt["byte_count"] == total_bytes
@@ -188,6 +270,7 @@ async def upload_batch(client, headers, upload_ids, body, total_bytes, total_row
                 "receipt": receipt,
                 "upload_seconds": round(elapsed, 3),
                 "upload_mib_per_second": round(total_bytes / 1024**2 / elapsed, 3),
+                **worker,
             },
             finished,
             wall_finished,
@@ -257,6 +340,7 @@ async def measure(args: argparse.Namespace, token: str, connection: asyncpg.Conn
     total_bytes = args.size_gib * GIB
     total_rows = total_bytes // ROW_BYTES
     concurrency = getattr(args, "concurrency", 1)
+    uvicorn_workers = getattr(args, "uvicorn_workers", None)
     counts_only = getattr(args, "verify_counts_only", False)
     mixed_layout = getattr(args, "mixed_layout", None)
     table = "stream_writer_bench.typed_rows" if mixed_layout == "columns" else "stream_writer.rows"
@@ -421,8 +505,18 @@ async def measure(args: argparse.Namespace, token: str, connection: asyncpg.Conn
     lsn_before = await connection.fetchval("SELECT pg_current_wal_insert_lsn()")
     sampler = asyncio.create_task(sample())
     try:
-        async with httpx.AsyncClient(base_url=args.url, timeout=3600) as client:
+        async with (
+            httpx.AsyncClient(base_url=args.url, timeout=3600) as client,
+            AsyncExitStack() as worker_stack,
+        ):
             assert (await client.get("/health/ready", headers=headers)).status_code == 200
+            workers = (
+                await warm_worker_clients(
+                    worker_stack, args.url, headers, concurrency, uvicorn_workers
+                )
+                if uvicorn_workers is not None
+                else None
+            )
             await discover_backends()
             if not pg_pids:
                 raise RuntimeError("Set the API DSN application_name=stream_writer_benchmark")
@@ -460,7 +554,7 @@ async def measure(args: argparse.Namespace, token: str, connection: asyncpg.Conn
                 )
             try:
                 uploads, upload_finished, wall_finished = await upload_batch(
-                    client, headers, upload_ids, body, total_bytes, total_rows
+                    client, headers, upload_ids, body, total_bytes, total_rows, workers=workers
                 )
                 client_upload_cpu_seconds = time.process_time() - client_cpu_started
             finally:
@@ -468,6 +562,7 @@ async def measure(args: argparse.Namespace, token: str, connection: asyncpg.Conn
                     await stop_activity(
                         activity_task, monitor, activity_stop, diagnostics["activity"]
                     )
+            await worker_stack.aclose()
             upload_seconds = upload_finished - started
             if diagnostics_enabled:
                 diagnostics["wall_clock_upload_seconds"] = round(wall_finished - wall_started, 6)
@@ -612,6 +707,8 @@ async def measure(args: argparse.Namespace, token: str, connection: asyncpg.Conn
         result["uploads"] = uploads
     if counts_only:
         result["verification_mode"] = "counts_only"
+    if uvicorn_workers is not None:
+        result["uvicorn_workers"] = uvicorn_workers
     if mixed_layout:
         result["input_profile"] = "mixed-25"
         result["storage_layout"] = mixed_layout
@@ -631,6 +728,12 @@ def main():
     parser.add_argument("--url", default="http://127.0.0.1:8080")
     parser.add_argument("--size-gib", type=int, choices=(1, 5), required=True)
     parser.add_argument("--concurrency", type=int, choices=(1, 2, 4), default=1)
+    parser.add_argument(
+        "--uvicorn-workers",
+        type=int,
+        choices=(1, 2, 4),
+        help="Warm and evenly allocate PUT connections across workers on one URL",
+    )
     parser.add_argument(
         "--upload-id",
         dest="upload_ids",
@@ -668,6 +771,8 @@ def main():
         parser.error("--min-disk-free-gib must be at least 1")
     if args.verify_counts_only and args.replay:
         parser.error("--verify-counts-only cannot be combined with --replay")
+    if args.uvicorn_workers is not None and args.concurrency % args.uvicorn_workers:
+        parser.error("--uvicorn-workers must divide --concurrency")
     result = asyncio.run(run(args))
     args.output.write_text(json.dumps(result, indent=2) + "\n")
     print(json.dumps(result, indent=2), flush=True)

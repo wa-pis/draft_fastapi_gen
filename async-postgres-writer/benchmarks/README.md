@@ -393,6 +393,109 @@ report="/tmp/mixed-$layout-$streams.json"
 скорость между режимами с одним и тем же входом: предыдущие замеры JSONB
 использовали другой, двухполевый объект.
 
+#### Один порт и несколько процессов Uvicorn
+
+Профиль обозначается как «процессы Uvicorn × размер пула каждого процесса».
+Во всех профилях суммарный верхний предел пула равен четырём:
+
+| Профиль | `BENCHMARK_UVICORN_WORKERS` | `WRITER_POOL_SIZE` | Одновременные PUT |
+| --- | ---: | ---: | ---: |
+| контроль 1×4 | 1 | 4 | 2 |
+| контроль 1×4 | 1 | 4 | 4 |
+| 2×2 | 2 | 2 | 2 |
+| 4×1 | 4 | 1 | 4 |
+
+Повторите каждый профиль для `jsonb` и `columns` на новом проекте с пустым томом.
+Используйте одни и те же образы и ресурсы VM во всех сценариях. Перед прогоном
+проверьте `wal_buffers=64MB`, `max_wal_size=8GB`, `shared_buffers=128MB`,
+`fsync=on`, `full_page_writes=on` и `synchronous_commit=on`. Следите за резервом
+на диске хоста и внутри `$PGDATA`; освобождение места в VM не обязательно
+сразу уменьшает её виртуальный диск на хосте.
+Все процессы слушают один порт одного контейнера; их запускает [Uvicorn
+`--workers`](https://uvicorn.dev/deployment/#built-in). Параметр клиента
+`--uvicorn-workers` находит процессы по ответам health-проверок, закрепляет за
+ними отдельные keep-alive соединения и проверяет PID каждого PUT. Если
+последовательные пробы не нашли все процессы, клиент пробует несколько соединений
+одновременно. Прогрев проходит до таймера.
+
+Следующий Bash-блок воспроизводит один профиль. Задайте первые четыре переменные
+по таблице, увеличивая `run` для повтора:
+
+```bash
+cd async-postgres-writer
+uv sync --locked
+layout=columns                 # или jsonb
+workers=2
+streams=2
+run=1
+export BENCHMARK_LAYOUT="$layout" BENCHMARK_UVICORN_WORKERS="$workers"
+export WRITER_POOL_SIZE=$((4 / workers)) POSTGRES_WAL_BUFFERS=64MB
+export POSTGRES_PASSWORD=$(.venv/bin/python -c 'import secrets; print(secrets.token_urlsafe(24))')
+export BENCHMARK_WRITER_PASSWORD=$(.venv/bin/python -c 'import secrets; print(secrets.token_urlsafe(24))')
+export WRITER_API_TOKEN=$(.venv/bin/python -c 'import secrets; print(secrets.token_urlsafe(32))')
+case_name="${layout}-w${workers}p${WRITER_POOL_SIZE}-c${streams}-r${run}"
+project="writer-pg17-uvicorn-${case_name}"
+compose=(docker compose -p "$project" -f compose.yaml -f compose.bulk.yaml
+         -f benchmarks/compose.override.yaml -f benchmarks/compose.workers.yaml)
+
+"${compose[@]}" build writer  # один раз на всю серию при неизменном коде
+"${compose[@]}" up -d --wait postgres
+"${compose[@]}" up -d --no-build init-db
+"${compose[@]}" wait init-db
+for sql in typed_rows.sql typed_rows_fk.sql; do
+  "${compose[@]}" exec -T postgres psql -X -v ON_ERROR_STOP=1 \
+    -U writer -d stream_writer -f - < "benchmarks/$sql"
+done
+"${compose[@]}" exec -T postgres psql -X -v ON_ERROR_STOP=1 \
+  -U writer -d stream_writer -v password="$BENCHMARK_WRITER_PASSWORD" \
+  -f - < benchmarks/worker_role.sql
+test "$("${compose[@]}" exec -T postgres psql -X -At -v ON_ERROR_STOP=1 \
+  -U writer -d stream_writer \
+  -c "SELECT concat(rolconnlimit, '/', rolsuper) FROM pg_roles \
+      WHERE rolname='benchmark_writer'")" = 4/false
+
+"${compose[@]}" exec -T postgres psql -X -v ON_ERROR_STOP=1 \
+  -U writer -d stream_writer \
+  -c 'ALTER SYSTEM SET track_io_timing = on' \
+  -c 'ALTER SYSTEM SET track_wal_io_timing = on' \
+  -c 'SELECT pg_reload_conf()'
+"${compose[@]}" up -d --wait --no-build writer
+"${compose[@]}" exec -T postgres psql -X -v ON_ERROR_STOP=1 \
+  -U writer -d stream_writer -c 'CHECKPOINT'
+sleep 1
+
+api_port=$("${compose[@]}" port writer 8080 | cut -d: -f2)
+pg_port=$("${compose[@]}" port postgres 5432 | cut -d: -f2)
+export WRITER_TEST_DATABASE_URL="postgresql://writer:${POSTGRES_PASSWORD}@127.0.0.1:${pg_port}/stream_writer"
+ids=()
+for ((i=1; i<=streams; i++)); do
+  ids+=(--upload-id "20000000-0000-4000-8000-00000000000$i")
+done
+report="/tmp/${project}.json"
+.venv/bin/python benchmarks/stream_load.py --url "http://127.0.0.1:${api_port}" \
+  --mixed-layout "$layout" --size-gib 5 --concurrency "$streams" \
+  --uvicorn-workers "$workers" --diagnostics --verify-counts-only \
+  --disk-path /tmp --min-disk-free-gib 20 --label "$case_name" \
+  "${ids[@]}" --output "$report"
+```
+
+`benchmark_writer` — отдельная роль приложения без прав суперпользователя с
+[`CONNECTION LIMIT 4`](https://www.postgresql.org/docs/17/sql-createrole.html);
+пароль выше подходит для строки подключения без экранирования.
+Сервис использует эту роль, а `stream_load.py`, диагностика и административные
+команды — роль `writer` через `WRITER_TEST_DATABASE_URL`, поэтому их соединения
+не занимают четыре места приложения. Не заменяйте эту строку подключения на
+`benchmark_writer`.
+
+В отчёте число разных `uploads[*].worker_pid` должно совпасть с `uvicorn_workers`,
+`diagnostics.activity.peak_active_copy_backends` — с `streams`, а
+`diagnostics.activity.peak_app_backends` не должно превышать 4; также проверьте
+`diagnostics.activity.coverage == "complete"`. По `active_copy_backend_histogram`
+видно, как часто все загрузки шли одновременно. Затем выполните описанную выше
+проверку перезапуска через `verify_mixed_restart.py`. Для полного прогона на новом
+томе замените `--verify-counts-only` на `--replay`. После сохранения отчёта и
+проверки удалите только этот тестовый проект: `"${compose[@]}" down --volumes`.
+
 ## Сравнить профили A/B
 
 Меняйте по одному фактору, сохраняя PostgreSQL/Python, зависимости, генератор,
