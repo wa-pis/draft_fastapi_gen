@@ -1,6 +1,7 @@
 import asyncio
 import hashlib
 from collections.abc import AsyncIterable, AsyncIterator
+from contextlib import asynccontextmanager
 from dataclasses import dataclass, replace
 from datetime import datetime
 from uuid import UUID
@@ -12,6 +13,13 @@ from .errors import WriterError
 from .stream import NDJSONStream
 
 _RECEIPT = "SELECT * FROM stream_writer.uploads WHERE upload_id = $1"
+_EXPORT_ROWS = (
+    "SELECT jsonb_build_object('row_number', row_number, 'data', data)::text "
+    "FROM stream_writer.rows WHERE upload_id = $1 ORDER BY row_number"
+)
+_READ_ERRORS = (asyncpg.PostgresError, asyncpg.InterfaceError, OSError, TimeoutError)
+_EXPORT_PREFETCH = 8
+MAX_PAGE_BYTES = 16 * 1024**2
 
 
 @dataclass(frozen=True)
@@ -29,6 +37,7 @@ def _receipt(row: asyncpg.Record) -> Receipt:
 
 
 class Store:
+    supports_result_reads = True
     _rows_check = "SELECT upload_id, row_number, data FROM stream_writer.rows LIMIT 0"
 
     def __init__(self, settings: Settings, pool: asyncpg.Pool) -> None:
@@ -53,6 +62,52 @@ class Store:
                 return _receipt(row) if row is not None else None
         except (asyncpg.PostgresError, asyncpg.InterfaceError, OSError, TimeoutError) as exc:
             raise WriterError(503, "database_unavailable", "Receipt lookup is unavailable") from exc
+
+    @asynccontextmanager
+    async def _committed_read(
+        self, upload_id: UUID
+    ) -> AsyncIterator[tuple[asyncpg.Connection, int]]:
+        try:
+            async with (
+                self.pool.acquire(timeout=self.settings.acquire_timeout_seconds) as conn,
+                conn.transaction(isolation="repeatable_read", readonly=True),
+            ):
+                total = await conn.fetchval(
+                    "SELECT row_count FROM stream_writer.uploads WHERE upload_id = $1", upload_id
+                )
+                if total is None:
+                    raise WriterError(404, "upload_not_found", "Committed upload not found")
+                yield conn, total
+        except _READ_ERRORS as exc:
+            raise WriterError(503, "database_unavailable", "Result read is unavailable") from exc
+
+    async def page(self, upload_id: UUID, limit: int, offset: int) -> tuple[int, list[bytes]]:
+        async with self._committed_read(upload_id) as (conn, total):
+            records: list[bytes] = []
+            if offset >= total:
+                return total, records
+            size = 0
+            async for row in conn.cursor(
+                _EXPORT_ROWS + " LIMIT $2 OFFSET $3",
+                upload_id,
+                limit,
+                offset,
+                prefetch=_EXPORT_PREFETCH,
+            ):
+                record = row[0].encode("utf-8")
+                size += len(record) + bool(records)  # JSON separators
+                if size > MAX_PAGE_BYTES:
+                    raise WriterError(
+                        413, "page_too_large", "Use a smaller limit or stream the result"
+                    )
+                records.append(record)
+            return total, records
+
+    @asynccontextmanager
+    async def stream_rows(self, upload_id: UUID) -> AsyncIterator[tuple[int, AsyncIterator[str]]]:
+        async with self._committed_read(upload_id) as (conn, total):
+            cursor = conn.cursor(_EXPORT_ROWS, upload_id, prefetch=_EXPORT_PREFETCH)
+            yield total, (row[0] async for row in cursor)
 
     async def write(self, upload_id: UUID, chunks: AsyncIterable[bytes]) -> Receipt:
         settings = self.settings

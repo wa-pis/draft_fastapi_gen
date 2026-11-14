@@ -10,11 +10,13 @@
 ## Контракт
 
 ```text
-PUT /v1/uploads/{upload_id}   NDJSON → COPY → COMMIT → receipt
-GET /v1/uploads/{upload_id}   проверка результата после потери ответа
+PUT /v1/uploads/{upload_id}              NDJSON → COPY → COMMIT → receipt
+GET /v1/uploads/{upload_id}              квитанция подтверждённой загрузки
+GET /v1/uploads/{upload_id}/rows         чтение страницы JSON: limit и offset
+GET /v1/uploads/{upload_id}/rows/stream  поток всех строк в NDJSON
 ```
 
-`upload_id` — UUID, выбранный отправителем до начала загрузки. Для обоих запросов нужен
+`upload_id` — UUID, выбранный отправителем до начала загрузки. Для всех этих запросов нужен
 `Authorization: Bearer <WRITER_API_TOKEN>`. PUT принимает только
 `Content-Type: application/x-ndjson`.
 Сжатое тело (`Content-Encoding: gzip` и другие варианты) не поддерживается.
@@ -98,6 +100,69 @@ SHA-256 исходных байтов и счётчики строк/байто�
 `415`, timeout входа — `408`; ошибки БД — `503`. `409` также означает, что загрузка того
 же UUID уже выполняется: дождитесь её результата и выполните GET или повтор.
 
+## Чтение данных через HTTP
+
+Оба режима читают строки одной подтверждённой загрузки по возрастанию `row_number`.
+Неизвестный UUID, загрузка в процессе или отменённая загрузка дают `404`.
+Ответы помечены `Cache-Control: no-store`. Для чтения не нужны прямой доступ к
+PostgreSQL или миграция схемы.
+
+Для чтения страниц передавайте `limit` от 1 до 1000 (по умолчанию 100) и
+`offset` от 0 до `9223372036854775807` (по умолчанию 0). Недопустимые значения дают
+`422`. `row_count` — общее число строк загрузки. Если `offset` достиг `row_count`,
+сервис возвращает `200` с пустым массивом `rows`. Если JSON-ответ превышает 16 МиБ,
+сервис возвращает `413`: уменьшите `limit` или выберите потоковую выгрузку.
+
+```bash
+curl --fail-with-body \
+  -H "Authorization: Bearer $WRITER_API_TOKEN" \
+  "http://127.0.0.1:8080/v1/uploads/$upload_id/rows?limit=1&offset=0"
+```
+
+```json
+{
+  "upload_id": "00000000-0000-0000-0000-000000000001",
+  "row_count": 2,
+  "limit": 1,
+  "offset": 0,
+  "rows": [{"row_number": 1, "data": {"calculation_id": "calc-42", "value": 12.5}}]
+}
+```
+
+Для полной выгрузки используйте `GET /rows/stream`: ответ `application/x-ndjson`
+содержит по одному объекту `{"row_number":1,"data":{...}}` на строку. Поток
+читает данные серверным курсором, без накопления всей выборки. Страницы и поток
+возвращают сохранённый JSONB, поэтому исходные байты, порядок ключей и SHA-256
+входного файла могут не совпасть с выгрузкой.
+
+```bash
+(
+  set -eu
+  download_dir=$(mktemp -d ./.download.XXXXXX)
+  trap 'rm -f "$download_dir/headers" "$download_dir/result.ndjson"; rmdir "$download_dir"' EXIT
+  curl --fail --no-buffer --dump-header "$download_dir/headers" \
+    --output "$download_dir/result.ndjson" \
+    -H "Authorization: Bearer $WRITER_API_TOKEN" \
+    "http://127.0.0.1:8080/v1/uploads/$upload_id/rows/stream"
+  expected=$(awk 'tolower($1) == "x-row-count:" { gsub(/\r/, "", $2); print $2 }' \
+    "$download_dir/headers")
+  actual=$(wc -l < "$download_dir/result.ndjson" | tr -d '[:space:]')
+  if [ "$actual" = "$expected" ]; then
+    mv "$download_dir/result.ndjson" result.ndjson
+  else
+    echo "Выгрузка неполная: ожидалось $expected, получено $actual" >&2
+    exit 1
+  fi
+)
+```
+
+Перед использованием файла убедитесь, что запрос завершился успешно и число строк
+совпало с `X-Row-Count` из заголовков. Ошибка БД до начала ответа даёт `503`;
+после отправки заголовков статус уже нельзя изменить, и поток прерывается.
+Неполный файл удалите и повторите GET. Каждый открытый поток удерживает соединение
+из общего пула до завершения, обрыва или таймаута. Для больших результатов он
+предпочтительнее обхода страниц с растущим `OFFSET`.
+
 ## Повторы и надёжность
 
 - Новый UUID и корректный поток создают один результат; ответ отправляется после commit.
@@ -112,7 +177,8 @@ SHA-256 исходных байтов и счётчики строк/байто�
   Новый UUID при таком сбое может создать отдельную копию результата.
 
 Данные лежат в `stream_writer.rows` (`upload_id`, `row_number`, `data jsonb`), receipt —
-в `stream_writer.uploads`. Читатель должен выбирать строки по подтверждённому UUID:
+в `stream_writer.uploads`. При прямом подключении к БД выбирайте строки по
+подтверждённому UUID:
 
 ```sql
 SELECT row_number, data
@@ -137,10 +203,11 @@ WAL, лаг реплик и место под JSONB/индексы. После �
 | --- | --- | --- |
 | `WRITER_DATABASE_URL` | обязательна | PostgreSQL DSN |
 | `WRITER_API_TOKEN` | обязательна | Bearer token, не менее 32 ASCII-символов без пробелов |
-| `WRITER_POOL_SIZE` | `4` | Размер пула; ограничивает параллельные загрузки |
+| `WRITER_POOL_SIZE` | `4` | Размер общего пула для записи и чтения |
 | `WRITER_MAX_UPLOAD_BYTES` | `5368709120` | Максимум исходного потока, 5 ГиБ |
 | `WRITER_MAX_LINE_BYTES` | `1048576` | Максимальный размер одной строки, 1 МиБ |
 | `WRITER_UPLOAD_TIMEOUT_SECONDS` | `3600` | Общий срок загрузки |
+| `WRITER_EXPORT_TIMEOUT_SECONDS` | `3600` | Общий срок `GET /rows/stream`, включая передачу ответа клиенту |
 | `WRITER_READ_TIMEOUT_SECONDS` | `30` | Ожидание следующей порции входа |
 | `WRITER_ACQUIRE_TIMEOUT_SECONDS` | `5` | Ожидание свободного соединения |
 | `WRITER_DB_COMMAND_TIMEOUT_SECONDS` | `60` | Срок обычной команды БД |
@@ -193,8 +260,9 @@ docker compose -f compose.yaml -f compose.bulk.yaml up --build -d writer
 Контейнер работает от UID 10001. В образе установлено приложение из wheel с зависимостями
 по lock-файлу; PyInstaller не используется.
 
-Для внешнего доступа нужен TLS reverse proxy: отключите буферизацию тела запроса,
-разрешите требуемый объём, согласуйте upload/read timeouts и ограничения соединений
+Для внешнего доступа нужен TLS reverse proxy: отключите буферизацию тела запроса
+для загрузки и тела ответа для потоковой выгрузки. Разрешите требуемый объём и
+согласуйте таймауты и ограничения соединений
 с настройками сервиса. Bearer token передавайте только по HTTPS. Пример Compose использует
 обычный HTTP на loopback и незашифрованное соединение БД внутри локального стенда.
 Для удалённого PostgreSQL задайте проверку сертификата и имени, например DSN с
