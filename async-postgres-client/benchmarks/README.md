@@ -95,3 +95,45 @@ for label in before-1 before-2 before-4 after-4 after-2 after-1 after-4-repeat b
 done
 printf 'Отчёты: %s\n' "$out"
 ```
+
+## Выборка курсора для двух и четырёх выгрузок
+
+[Результаты эксперимента](results/2026-11-15-compose-pg17-ndjson-prefetch-9m.json).
+Используйте тот же выделенный стенд и набор на 9 млн строк. У PostgreSQL
+оставьте WAL-буфер 64 МиБ, у приложения — один воркер и четыре подключения.
+Пересоздавайте только API между прогонами, оставляя том и кэш PostgreSQL.
+
+Соберите API с поддержкой `WRITER_EXPORT_PREFETCH_ROWS`. Добавьте переменную
+`WRITER_EXPORT_PREFETCH_ROWS: ${WRITER_EXPORT_PREFETCH_ROWS:-8}` в `environment`
+сервиса `writer` в вашем Compose-файле, если её там ещё нет. Значение 8
+воспроизводит прежний размер выборки курсора, 32 — проверяемый вариант.
+Лимит порции HTTP остаётся 128 КиБ в обоих случаях. Для проверки влияния
+декодера дополнительно прогоните старый SDK из `6b57ee5` при выборке 8
+через `git archive` и `PYTHONPATH`, как выше.
+
+Из `async-postgres-writer` с подготовленным стендом и массивом Compose `c`:
+
+```bash
+set -e
+out=$(mktemp -d)
+for label in 8-4 8-2 32-4 32-2 32-2-repeat 8-2-repeat 32-4-repeat 8-4-repeat; do
+  export WRITER_EXPORT_PREFETCH_ROWS=${label%%-*}
+  readers=${label#*-}
+  "${c[@]}" up -d --wait --no-build --no-deps --force-recreate writer
+  url="http://$("${c[@]}" port writer 8080)"
+  PYTHONPATH=../async-postgres-client/src ../async-postgres-client/.venv/bin/python \
+    ../async-postgres-client/benchmarks/read_load_cadence.py --url "$url" --label "$label" \
+    --upload-id 90000000-0000-4000-8000-000000000001 --concurrency "${readers%%-*}" \
+    --expected-bytes 2341158725 \
+    --expected-sha256 4b970bbbd31fd195642cf6ac2ed5e12864aa108b57db05b76bcd9f976d9b2f8f \
+    --output "$out/$label.json"
+done
+printf 'Отчёты: %s\n' "$out"
+```
+
+Снимайте `cpu.stat` API и PostgreSQL до и после прогона (`usage_usec`,
+`user_usec`, `system_usec`, `nr_throttled`). Для диагностики разницы добавьте
+`/proc/net/snmp` PostgreSQL и поля `voluntary_ctxt_switches` и
+`nonvoluntary_ctxt_switches` из `/proc/<pid>/status` процессов роли приложения.
+Размеры фрагментов в клиентском отчёте описывают чтение HTTP и могут отличаться
+от порций, которые отправляет сервер.

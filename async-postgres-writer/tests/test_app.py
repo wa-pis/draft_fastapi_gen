@@ -161,6 +161,8 @@ async def test_upload_id_is_uuid(app_store):
         {"database_url": "https://not-postgresql"},
         {"pool_size": 0},
         {"pool_size": 33},
+        {"export_prefetch_rows": 0},
+        {"export_prefetch_rows": 33},
         {"max_upload_bytes": 0},
         {"max_line_bytes": 0},
         {"read_timeout_seconds": 0},
@@ -183,8 +185,10 @@ def test_settings_reads_env_and_hides_secrets(monkeypatch):
     monkeypatch.setenv("WRITER_DATABASE_URL", "postgresql://test:secret@localhost/db")
     monkeypatch.setenv("WRITER_API_TOKEN", TOKEN)
     monkeypatch.setenv("WRITER_POOL_SIZE", "2")
+    monkeypatch.setenv("WRITER_EXPORT_PREFETCH_ROWS", "32")
     settings = Settings()
     assert settings.pool_size == 2
+    assert settings.export_prefetch_rows == 32
     assert "secret" not in repr(settings)
     assert TOKEN not in repr(settings)
     with pytest.raises(ValidationError) as error:
