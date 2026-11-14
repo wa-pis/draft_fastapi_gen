@@ -1,0 +1,492 @@
+{
+  "benchmark_date_local": "2026-11-14",
+  "environment": "Apple M4 Max; Colima 0.9.1 VZ arm64 Linux, 6 vCPU / 8 GiB RAM, Docker Compose 5.7.0 with one PostgreSQL container and one API container at a time. Uvicorn 1 worker, pool max 4; host HTTP client Python 3.13.14; API Python 3.13.18.",
+  "baseline_git_commit": "bd6e8600cb6c39609230c8469c1850476be19ecf",
+  "baseline_image_id": "sha256:54df5dae90cbf40a8001fd82b7e1c8ecd4a51d41dabee5689b691bcac4948138",
+  "candidate_image_id": "sha256:1354a3f4ec00e66534db81a669f092df5c84ce17cf7dfc3a9261cda279014044",
+  "postgres_image": "postgres@sha256:ff87138949ad9a46f32ff23bd6852b52ce024a13dffe9b4087be98292cdd3b4f",
+  "postgres_settings": {
+    "wal_buffers": "64MB",
+    "max_wal_size": "4GB",
+    "track_io_timing": true,
+    "fsync": true,
+    "full_page_writes": true,
+    "synchronous_commit": true
+  },
+  "runtime_source_sha256": {
+    "baseline": {
+      "config.py": "43c056e704a73fa4fdb2566235a6ed34b8033e4c309ab9fd966337eefffcad3a",
+      "__init__.py": "46b9e9d943e72d88db0aca1e5ecceee4b45de5b18bf590836a7cd97d0eb28be5",
+      "stream.py": "dcf53d3b37a00be61cb2c8ed54b2ed46aef99c20a582eebb90e596be4d0b3c0c",
+      "app.py": "2c2740654e22825af23f5fce373610f7c7094e6c2f69311cda013ebe1f462f23",
+      "writer.py": "9433c62f9b0113c23252076d428f65fcd595620cbc1ad20cce840a48eaa7a20c",
+      "errors.py": "4e137b6160a030ff1d7ffa9606157a6c71398e7723daada628f5e1821a5c9893",
+      "__main__.py": "005b97f380d6690162d1b8b12acf33728ee16b34af1ce0e6fe6bb3edb5467381"
+    },
+    "candidate": {
+      "config.py": "43c056e704a73fa4fdb2566235a6ed34b8033e4c309ab9fd966337eefffcad3a",
+      "__init__.py": "46b9e9d943e72d88db0aca1e5ecceee4b45de5b18bf590836a7cd97d0eb28be5",
+      "stream.py": "dcf53d3b37a00be61cb2c8ed54b2ed46aef99c20a582eebb90e596be4d0b3c0c",
+      "app.py": "e0e00893c98fcfc1e2e7f1b54f68f699c4464e5a87ffef0f0f33fb0309eed75a",
+      "writer.py": "edcbffdeaae1505dad495aa8c37a83c656a527721cd31aec4dd4a0afec832f89",
+      "errors.py": "4e137b6160a030ff1d7ffa9606157a6c71398e7723daada628f5e1821a5c9893",
+      "__main__.py": "005b97f380d6690162d1b8b12acf33728ee16b34af1ce0e6fe6bb3edb5467381"
+    }
+  },
+  "measurement_order": [
+    "pages-baseline",
+    "pages-candidate",
+    "baseline-1",
+    "candidate-1",
+    "candidate-2",
+    "baseline-2"
+  ],
+  "fixture": {
+    "upload_id": "90000000-0000-4000-8000-000000000001",
+    "seeded_rows": 9000000,
+    "fixture": "deterministic JSONB via SQL generate_series (synthetic receipt)",
+    "seed_sql_sha256": "4e5764600f189bb707fa0eb4b50523c41bdff00606ebd40933f77f38fe6dbb16",
+    "postgres_version": "17.11 (Debian 17.11-1.pgdg13+2)",
+    "rows_relation_bytes": 3086016512
+  },
+  "memory_and_cpu_scope": "API and PostgreSQL cgroup usage_usec delta around each HTTP client invocation, includes receipt and measurement overhead; API PID 1 lifetime VmHWM from freshly started container, PostgreSQL backend VmRSS and RssAnon sampled every 0.5 s (RSS includes shared memory). Client CPU is process_time within body read incl newline count and SHA-256; monotonic TTFB is first body bytes. All runs used the same already-populated volume without clearing OS caches between cases.",
+  "stream_summary_median": {
+    "baseline": {
+      "download_seconds": 217.36243316694163,
+      "ttfb_seconds": 0.05386912543326616,
+      "rows_per_second": 41405.76107699635,
+      "mib_per_second": 10.27186275171443,
+      "api_cpu_seconds": 153.446131,
+      "pg_cpu_seconds": 58.789125999999996,
+      "client_cpu_seconds": 139.64942150000002,
+      "api_peak_rss_mib": 53.13671875,
+      "pg_peak_rss_mib": 220.775390625,
+      "pg_peak_anon_rss_mib": 25.677734375,
+      "client_peak_rss_mib": 43.328125
+    },
+    "candidate": {
+      "download_seconds": 91.65157050010748,
+      "ttfb_seconds": 0.05524474987760186,
+      "rows_per_second": 98473.12570928299,
+      "mib_per_second": 24.429026437580287,
+      "api_cpu_seconds": 45.830845499999995,
+      "pg_cpu_seconds": 34.811599,
+      "client_cpu_seconds": 5.356138,
+      "api_peak_rss_mib": 53.955078125,
+      "pg_peak_rss_mib": 220.865234375,
+      "pg_peak_anon_rss_mib": 25.724609375,
+      "client_peak_rss_mib": 44.875
+    }
+  },
+  "stream_runs": {
+    "baseline-1": {
+      "label": "baseline-1",
+      "upload_id": "90000000-0000-4000-8000-000000000001",
+      "stream": {
+        "seconds": 217.90932741714641,
+        "ttfb_seconds": 0.05598329193890095,
+        "rows": 9000000,
+        "bytes": 2341158725,
+        "sha256": "4b970bbbd31fd195642cf6ac2ed5e12864aa108b57db05b76bcd9f976d9b2f8f",
+        "rows_per_second": 41301.58220703969,
+        "mib_per_second": 10.246018255055292,
+        "client_cpu_seconds": 139.121001,
+        "client_peak_rss_bytes": 45350912
+      },
+      "cpu_seconds": {
+        "api": 153.517772,
+        "pg": 58.105578
+      },
+      "memory": {
+        "api_process_peak_rss_bytes": 55717888,
+        "pg_backend_sampled_max_rss_bytes": 231591936,
+        "pg_backend_sampled_max_anon_rss_bytes": 26972160,
+        "pg_backend_rss_sample_count": 436
+      }
+    },
+    "candidate-1": {
+      "label": "candidate-1",
+      "upload_id": "90000000-0000-4000-8000-000000000001",
+      "stream": {
+        "seconds": 86.80700804200023,
+        "ttfb_seconds": 0.054762874729931355,
+        "rows": 9000000,
+        "bytes": 2341158725,
+        "sha256": "4b970bbbd31fd195642cf6ac2ed5e12864aa108b57db05b76bcd9f976d9b2f8f",
+        "rows_per_second": 103678.26518851437,
+        "mib_per_second": 25.720307576810434,
+        "client_cpu_seconds": 5.2229969999999994,
+        "client_peak_rss_bytes": 46956544
+      },
+      "cpu_seconds": {
+        "api": 44.203271,
+        "pg": 33.374541
+      },
+      "memory": {
+        "api_process_peak_rss_bytes": 56643584,
+        "pg_backend_sampled_max_rss_bytes": 231596032,
+        "pg_backend_sampled_max_anon_rss_bytes": 26976256,
+        "pg_backend_rss_sample_count": 174
+      }
+    },
+    "candidate-2": {
+      "label": "candidate-2",
+      "upload_id": "90000000-0000-4000-8000-000000000001",
+      "stream": {
+        "seconds": 96.49613295821473,
+        "ttfb_seconds": 0.05572662502527237,
+        "rows": 9000000,
+        "bytes": 2341158725,
+        "sha256": "4b970bbbd31fd195642cf6ac2ed5e12864aa108b57db05b76bcd9f976d9b2f8f",
+        "rows_per_second": 93267.9862300516,
+        "mib_per_second": 23.13774529835014,
+        "client_cpu_seconds": 5.489279,
+        "client_peak_rss_bytes": 47153152
+      },
+      "cpu_seconds": {
+        "api": 47.45842,
+        "pg": 36.248657
+      },
+      "memory": {
+        "api_process_peak_rss_bytes": 56508416,
+        "pg_backend_sampled_max_rss_bytes": 231591936,
+        "pg_backend_sampled_max_anon_rss_bytes": 26972160,
+        "pg_backend_rss_sample_count": 192
+      }
+    },
+    "baseline-2": {
+      "label": "baseline-2",
+      "upload_id": "90000000-0000-4000-8000-000000000001",
+      "stream": {
+        "seconds": 216.81553891673684,
+        "ttfb_seconds": 0.05175495892763138,
+        "rows": 9000000,
+        "bytes": 2341158725,
+        "sha256": "4b970bbbd31fd195642cf6ac2ed5e12864aa108b57db05b76bcd9f976d9b2f8f",
+        "rows_per_second": 41509.93994695301,
+        "mib_per_second": 10.29770724837357,
+        "client_cpu_seconds": 140.177842,
+        "client_peak_rss_bytes": 45514752
+      },
+      "cpu_seconds": {
+        "api": 153.37449,
+        "pg": 59.472674
+      },
+      "memory": {
+        "api_process_peak_rss_bytes": 55717888,
+        "pg_backend_sampled_max_rss_bytes": 231407616,
+        "pg_backend_sampled_max_anon_rss_bytes": 26877952,
+        "pg_backend_rss_sample_count": 433
+      }
+    }
+  },
+  "pages": {
+    "baseline": [
+      {
+        "position": 0,
+        "limit": 100,
+        "samples_seconds": {
+          "offset": [
+            0.004541999660432339,
+            0.002495124936103821,
+            0.00218158308416605,
+            0.0022648749873042107,
+            0.0023069591261446476
+          ]
+        },
+        "median_seconds": {
+          "offset": 0.0023069591261446476
+        }
+      },
+      {
+        "position": 4500000,
+        "limit": 100,
+        "samples_seconds": {
+          "offset": [
+            5.671172915957868,
+            5.443040333222598,
+            5.3655535420402884,
+            5.37729279184714,
+            5.470768624916673
+          ]
+        },
+        "median_seconds": {
+          "offset": 5.443040333222598
+        }
+      },
+      {
+        "position": 8999900,
+        "limit": 100,
+        "samples_seconds": {
+          "offset": [
+            11.013287958223373,
+            10.86783825000748,
+            10.851627750322223,
+            10.72655374975875,
+            10.922276625409722
+          ]
+        },
+        "median_seconds": {
+          "offset": 10.86783825000748
+        }
+      }
+    ],
+    "candidate": [
+      {
+        "position": 0,
+        "limit": 100,
+        "samples_seconds": {
+          "offset": [
+            0.003536792006343603,
+            0.002419792115688324,
+            0.0021031666547060013,
+            0.0025634998455643654,
+            0.001970957964658737
+          ],
+          "after_row_number": [
+            0.00282175000756979,
+            0.0029074158519506454,
+            0.002028999850153923,
+            0.0026026670821011066,
+            0.0021468750201165676
+          ]
+        },
+        "median_seconds": {
+          "offset": 0.002419792115688324,
+          "after_row_number": 0.0026026670821011066
+        }
+      },
+      {
+        "position": 4500000,
+        "limit": 100,
+        "samples_seconds": {
+          "offset": [
+            5.454308750107884,
+            5.392700415570289,
+            5.330817041918635,
+            5.46252491697669,
+            5.526394332759082
+          ],
+          "after_row_number": [
+            0.0031264577992260456,
+            0.0030275420285761356,
+            0.0030200001783668995,
+            0.002716374583542347,
+            0.0029605827294290066
+          ]
+        },
+        "median_seconds": {
+          "offset": 5.454308750107884,
+          "after_row_number": 0.0030200001783668995
+        }
+      },
+      {
+        "position": 8999900,
+        "limit": 100,
+        "samples_seconds": {
+          "offset": [
+            10.852796541992575,
+            10.7941371249035,
+            11.018692416604608,
+            11.101169624831527,
+            11.243958749808371
+          ],
+          "after_row_number": [
+            0.0031859162263572216,
+            0.0032547079026699066,
+            0.002405750099569559,
+            0.002217958215624094,
+            0.0033591249957680702
+          ]
+        },
+        "median_seconds": {
+          "offset": 11.018692416604608,
+          "after_row_number": 0.0031859162263572216
+        }
+      }
+    ]
+  },
+  "page_query_plans_at_8999900": {
+    "offset": {
+      "Plan": {
+        "Node Type": "Limit",
+        "Parallel Aware": false,
+        "Async Capable": false,
+        "Startup Cost": 1171229.73,
+        "Total Cost": 1171242.75,
+        "Plan Rows": 100,
+        "Plan Width": 40,
+        "Actual Rows": 100,
+        "Actual Loops": 1,
+        "Shared Hit Blocks": 0,
+        "Shared Read Blocks": 376346,
+        "Shared Dirtied Blocks": 0,
+        "Shared Written Blocks": 0,
+        "Local Hit Blocks": 0,
+        "Local Read Blocks": 0,
+        "Local Dirtied Blocks": 0,
+        "Local Written Blocks": 0,
+        "Temp Read Blocks": 0,
+        "Temp Written Blocks": 0,
+        "Shared I/O Read Time": 354.941,
+        "Shared I/O Write Time": 0.0,
+        "Local I/O Read Time": 0.0,
+        "Local I/O Write Time": 0.0,
+        "Temp I/O Read Time": 0.0,
+        "Temp I/O Write Time": 0.0,
+        "Plans": [
+          {
+            "Node Type": "Index Scan",
+            "Parent Relationship": "Outer",
+            "Parallel Aware": false,
+            "Async Capable": false,
+            "Scan Direction": "Forward",
+            "Index Name": "rows_pkey",
+            "Relation Name": "rows",
+            "Alias": "rows",
+            "Startup Cost": 0.56,
+            "Total Cost": 1171242.75,
+            "Plan Rows": 9000000,
+            "Plan Width": 40,
+            "Actual Rows": 9000000,
+            "Actual Loops": 1,
+            "Index Cond": "(upload_id = '90000000-0000-4000-8000-000000000001'::uuid)",
+            "Rows Removed by Index Recheck": 0,
+            "Shared Hit Blocks": 0,
+            "Shared Read Blocks": 376346,
+            "Shared Dirtied Blocks": 0,
+            "Shared Written Blocks": 0,
+            "Local Hit Blocks": 0,
+            "Local Read Blocks": 0,
+            "Local Dirtied Blocks": 0,
+            "Local Written Blocks": 0,
+            "Temp Read Blocks": 0,
+            "Temp Written Blocks": 0,
+            "Shared I/O Read Time": 354.941,
+            "Shared I/O Write Time": 0.0,
+            "Local I/O Read Time": 0.0,
+            "Local I/O Write Time": 0.0,
+            "Temp I/O Read Time": 0.0,
+            "Temp I/O Write Time": 0.0
+          }
+        ]
+      },
+      "Planning": {
+        "Shared Hit Blocks": 96,
+        "Shared Read Blocks": 29,
+        "Shared Dirtied Blocks": 0,
+        "Shared Written Blocks": 0,
+        "Local Hit Blocks": 0,
+        "Local Read Blocks": 0,
+        "Local Dirtied Blocks": 0,
+        "Local Written Blocks": 0,
+        "Temp Read Blocks": 0,
+        "Temp Written Blocks": 0,
+        "Shared I/O Read Time": 0.068,
+        "Shared I/O Write Time": 0.0,
+        "Local I/O Read Time": 0.0,
+        "Local I/O Write Time": 0.0,
+        "Temp I/O Read Time": 0.0,
+        "Temp I/O Write Time": 0.0
+      },
+      "Planning Time": 0.248,
+      "Triggers": [],
+      "JIT": {
+        "Functions": 6,
+        "Options": {
+          "Inlining": true,
+          "Optimization": true,
+          "Expressions": true,
+          "Deforming": true
+        }
+      },
+      "Execution Time": 11005.72
+    },
+    "after_row_number": {
+      "Plan": {
+        "Node Type": "Limit",
+        "Parallel Aware": false,
+        "Async Capable": false,
+        "Startup Cost": 0.56,
+        "Total Cost": 184.47,
+        "Plan Rows": 101,
+        "Plan Width": 40,
+        "Actual Rows": 100,
+        "Actual Loops": 1,
+        "Shared Hit Blocks": 6,
+        "Shared Read Blocks": 6,
+        "Shared Dirtied Blocks": 0,
+        "Shared Written Blocks": 0,
+        "Local Hit Blocks": 0,
+        "Local Read Blocks": 0,
+        "Local Dirtied Blocks": 0,
+        "Local Written Blocks": 0,
+        "Temp Read Blocks": 0,
+        "Temp Written Blocks": 0,
+        "Shared I/O Read Time": 0.017,
+        "Shared I/O Write Time": 0.0,
+        "Local I/O Read Time": 0.0,
+        "Local I/O Write Time": 0.0,
+        "Temp I/O Read Time": 0.0,
+        "Temp I/O Write Time": 0.0,
+        "Plans": [
+          {
+            "Node Type": "Index Scan",
+            "Parent Relationship": "Outer",
+            "Parallel Aware": false,
+            "Async Capable": false,
+            "Scan Direction": "Forward",
+            "Index Name": "rows_pkey",
+            "Relation Name": "rows",
+            "Alias": "rows",
+            "Startup Cost": 0.56,
+            "Total Cost": 1639.37,
+            "Plan Rows": 900,
+            "Plan Width": 40,
+            "Actual Rows": 100,
+            "Actual Loops": 1,
+            "Index Cond": "((upload_id = '90000000-0000-4000-8000-000000000001'::uuid) AND (row_number > 8999900))",
+            "Rows Removed by Index Recheck": 0,
+            "Shared Hit Blocks": 6,
+            "Shared Read Blocks": 6,
+            "Shared Dirtied Blocks": 0,
+            "Shared Written Blocks": 0,
+            "Local Hit Blocks": 0,
+            "Local Read Blocks": 0,
+            "Local Dirtied Blocks": 0,
+            "Local Written Blocks": 0,
+            "Temp Read Blocks": 0,
+            "Temp Written Blocks": 0,
+            "Shared I/O Read Time": 0.017,
+            "Shared I/O Write Time": 0.0,
+            "Local I/O Read Time": 0.0,
+            "Local I/O Write Time": 0.0,
+            "Temp I/O Read Time": 0.0,
+            "Temp I/O Write Time": 0.0
+          }
+        ]
+      },
+      "Planning": {
+        "Shared Hit Blocks": 0,
+        "Shared Read Blocks": 3,
+        "Shared Dirtied Blocks": 0,
+        "Shared Written Blocks": 0,
+        "Local Hit Blocks": 0,
+        "Local Read Blocks": 0,
+        "Local Dirtied Blocks": 0,
+        "Local Written Blocks": 0,
+        "Temp Read Blocks": 0,
+        "Temp Written Blocks": 0,
+        "Shared I/O Read Time": 0.004,
+        "Shared I/O Write Time": 0.0,
+        "Local I/O Read Time": 0.0,
+        "Local I/O Write Time": 0.0,
+        "Temp I/O Read Time": 0.0,
+        "Temp I/O Write Time": 0.0
+      },
+      "Planning Time": 0.056,
+      "Triggers": [],
+      "Execution Time": 0.18
+    }
+  }
+}

@@ -22,6 +22,7 @@ from .writer import MAX_PAGE_BYTES, Store, WriterError
 
 _NO_STORE = {"Cache-Control": "no-store"}
 _NDJSON = "application/x-ndjson"
+_NDJSON_CHUNK_BYTES = 128 * 1024
 
 
 class _ResultRow(BaseModel):
@@ -29,12 +30,20 @@ class _ResultRow(BaseModel):
     data: dict[str, object]
 
 
-class _ResultPage(BaseModel):
+class _ResultPageBase(BaseModel):
     upload_id: UUID
     row_count: int
     limit: int
-    offset: int
     rows: list[_ResultRow]
+
+
+class _ResultPage(_ResultPageBase):
+    offset: int
+
+
+class _KeysetResultPage(_ResultPageBase):
+    after_row_number: int
+    next_after_row_number: int | None
 
 
 class _ResultStream(StreamingResponse):
@@ -63,19 +72,32 @@ class _ResultStream(StreamingResponse):
             ):
                 first = await anext(rows, None)
 
-                async def lines() -> AsyncIterator[str]:
-                    sent = 0
-                    if first is not None:
-                        sent += 1
-                        yield first + "\n"
-                    async for row in rows:
-                        sent += 1
-                        yield row + "\n"
+                async def chunks() -> AsyncIterator[bytes]:
+                    sent = int(first is not None)
+                    buffer = bytearray()
+                    row = first
+                    while row is not None:
+                        record = row.encode("utf-8") + b"\n"
+                        if len(buffer) + len(record) > _NDJSON_CHUNK_BYTES and buffer:
+                            yield bytes(buffer)
+                            buffer.clear()
+                        if len(record) >= _NDJSON_CHUNK_BYTES:
+                            for start in range(0, len(record), _NDJSON_CHUNK_BYTES):
+                                yield record[start : start + _NDJSON_CHUNK_BYTES]
+                        else:
+                            buffer.extend(record)
+                            if len(buffer) == _NDJSON_CHUNK_BYTES:
+                                yield bytes(buffer)
+                                buffer.clear()
+                        row = await anext(rows, None)
+                        sent += int(row is not None)
                     if sent != count:
                         raise RuntimeError("Result export did not match its receipt")
+                    if buffer:
+                        yield bytes(buffer)
 
                 self.headers["X-Row-Count"] = str(count)
-                self.body_iterator = lines()
+                self.body_iterator = chunks()
                 await super().__call__(scope, receive, track_start)
         except ClientDisconnect:
             return
@@ -182,17 +204,27 @@ def create_app(settings: Settings | None = None, *, store_type: type[Store] = St
         @app.get(
             "/v1/uploads/{upload_id}/rows",
             dependencies=[Depends(authenticate)],
-            response_model=_ResultPage,
+            response_model=_ResultPage | _KeysetResultPage,
         )
         async def result_page(
             upload_id: UUID,
             request: Request,
             limit: Annotated[int, Query(ge=1, le=1000)] = 100,
-            offset: Annotated[int, Query(ge=0, le=2**63 - 1)] = 0,
+            offset: Annotated[int | None, Query(ge=0, le=2**63 - 1)] = None,
+            after_row_number: Annotated[int | None, Query(ge=0, le=2**63 - 1)] = None,
         ) -> Response:
-            total, rows = await request.app.state.store.page(upload_id, limit, offset)
+            if offset is not None and after_row_number is not None:
+                raise HTTPException(422, "Use either offset or after_row_number")
+            total, rows, next_after = await request.app.state.store.page(
+                upload_id, limit, offset or 0, after_row_number=after_row_number
+            )
+            position = (
+                {"offset": offset or 0}
+                if after_row_number is None
+                else {"after_row_number": after_row_number, "next_after_row_number": next_after}
+            )
             metadata = json.dumps(
-                {"upload_id": str(upload_id), "row_count": total, "limit": limit, "offset": offset},
+                {"upload_id": str(upload_id), "row_count": total, "limit": limit, **position},
                 separators=(",", ":"),
             ).encode()
             prefix = metadata[:-1] + b',"rows":['

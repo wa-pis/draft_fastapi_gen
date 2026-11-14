@@ -13,9 +13,13 @@ from .errors import WriterError
 from .stream import NDJSONStream
 
 _RECEIPT = "SELECT * FROM stream_writer.uploads WHERE upload_id = $1"
+_EXPORT_RECORD = "jsonb_build_object('row_number', row_number, 'data', data)::text"
 _EXPORT_ROWS = (
-    "SELECT jsonb_build_object('row_number', row_number, 'data', data)::text "
-    "FROM stream_writer.rows WHERE upload_id = $1 ORDER BY row_number"
+    f"SELECT {_EXPORT_RECORD} FROM stream_writer.rows WHERE upload_id = $1 ORDER BY row_number"
+)
+_EXPORT_ROWS_AFTER = (
+    f"SELECT {_EXPORT_RECORD}, row_number FROM stream_writer.rows "
+    "WHERE upload_id = $1 AND row_number > $2 ORDER BY row_number LIMIT $3"
 )
 _READ_ERRORS = (asyncpg.PostgresError, asyncpg.InterfaceError, OSError, TimeoutError)
 _EXPORT_PREFETCH = 8
@@ -81,19 +85,24 @@ class Store:
         except _READ_ERRORS as exc:
             raise WriterError(503, "database_unavailable", "Result read is unavailable") from exc
 
-    async def page(self, upload_id: UUID, limit: int, offset: int) -> tuple[int, list[bytes]]:
+    async def page(
+        self, upload_id: UUID, limit: int, offset: int = 0, *, after_row_number: int | None = None
+    ) -> tuple[int, list[bytes], int | None]:
         async with self._committed_read(upload_id) as (conn, total):
             records: list[bytes] = []
-            if offset >= total:
-                return total, records
+            if after_row_number is None:
+                if offset >= total:
+                    return total, records, None
+                query = _EXPORT_ROWS + " LIMIT $2 OFFSET $3"
+                bounds = (limit, offset)
+            else:
+                query = _EXPORT_ROWS_AFTER
+                bounds = (after_row_number, limit + 1)
             size = 0
-            async for row in conn.cursor(
-                _EXPORT_ROWS + " LIMIT $2 OFFSET $3",
-                upload_id,
-                limit,
-                offset,
-                prefetch=_EXPORT_PREFETCH,
-            ):
+            last_row_number = None
+            async for row in conn.cursor(query, upload_id, *bounds, prefetch=_EXPORT_PREFETCH):
+                if len(records) == limit:
+                    return total, records, last_row_number
                 record = row[0].encode("utf-8")
                 size += len(record) + bool(records)  # JSON separators
                 if size > MAX_PAGE_BYTES:
@@ -101,7 +110,9 @@ class Store:
                         413, "page_too_large", "Use a smaller limit or stream the result"
                     )
                 records.append(record)
-            return total, records
+                if after_row_number is not None:
+                    last_row_number = row[1]
+            return total, records, None
 
     @asynccontextmanager
     async def stream_rows(self, upload_id: UUID) -> AsyncIterator[tuple[int, AsyncIterator[str]]]:
