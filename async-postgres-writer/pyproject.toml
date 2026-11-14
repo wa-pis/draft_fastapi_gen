@@ -11,6 +11,7 @@ dependencies = [
     "asyncpg>=0.31,<0.32",
     "fastapi>=0.121,<1",
     "pydantic-settings>=2.12,<3",
+    "pyyaml>=6.0.3,<7",
     "uvicorn>=0.38,<1",
 ]
 
@@ -20,6 +21,8 @@ async-postgres-writer = "async_postgres_writer.__main__:main"
 [dependency-groups]
 dev = [
     "httpx>=0.28,<1",
+    "openapi-schema-validator>=0.9,<1",
+    "openapi-spec-validator>=0.7,<1",
     "pytest>=8.4,<10",
     "pytest-asyncio>=1.2,<2",
     "ruff>=0.14,<1",
@@ -27,6 +30,9 @@ dev = [
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/async_postgres_writer"]
+
+[tool.hatch.build.targets.wheel.force-include]
+"openapi/stream-writer.v1.yaml" = "async_postgres_writer/stream-writer.v1.yaml"
 
 [tool.pytest.ini_options]
 addopts = ["--strict-markers", "-m", "not integration"]

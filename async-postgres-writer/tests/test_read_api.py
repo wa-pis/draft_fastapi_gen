@@ -109,7 +109,9 @@ async def test_initial_cursor_failure_returns_503_before_any_stream_headers(app)
     assert response.json()["error"] == "database_unavailable"
 
 
-async def run_interrupted_stream(app, spec_version, *, disconnect=True, block=True):
+async def run_interrupted_stream(
+    app, spec_version, *, disconnect=True, block=True, expect_failure=None
+):
     """ASGITransport buffers responses and cannot simulate a failed socket write."""
     path = f"{ROWS}/stream"
     scope = {
@@ -143,13 +145,15 @@ async def run_interrupted_stream(app, spec_version, *, disconnect=True, block=Tr
                 raise OSError("client disconnected during a send")
             await asyncio.Future()  # Stop making progress until the disconnect is read.
 
+    if expect_failure is None:
+        expect_failure = block
     async with asyncio.timeout(3):
         if disconnect:
             try:
                 await app(scope, receive, send)
             except (OSError, ClientDisconnect):
                 assert spec_version == "2.4"
-        elif block:
+        elif expect_failure:
             with pytest.raises(RuntimeError):
                 await app(scope, receive, send)
         else:
@@ -159,7 +163,7 @@ async def run_interrupted_stream(app, spec_version, *, disconnect=True, block=Tr
     assert sent[0]["status"] == 200
     assert first_body.is_set() == block
     finished = any(m["type"] == "http.response.body" and not m.get("more_body") for m in sent)
-    assert finished != block
+    assert finished != expect_failure
     return [m["body"] for m in sent if m["type"] == "http.response.body" and m.get("more_body")]
 
 
@@ -215,6 +219,31 @@ async def test_export_batches_small_rows_and_preserves_wide_utf8_rows(app):
     assert chunks[0] == ("\n".join(rows[:2]) + "\n").encode()
     assert max(map(len, chunks)) == 128 * 1024
     assert b"".join(chunks) == ("\n".join(rows) + "\n").encode()
+
+
+async def test_database_failure_after_first_chunk_cannot_complete_export(app):
+    class FailingStore:
+        open = False
+
+        @asynccontextmanager
+        async def stream_rows(self, _):
+            async def records():
+                yield '{"row_number":1,"data":{"value":"' + "x" * (128 * 1024) + '"}}'
+                raise WriterError(503, "database_unavailable", "Result read is unavailable")
+
+            self.open = True
+            try:
+                yield 2, records()
+            finally:
+                self.open = False
+
+    store = FailingStore()
+    app.state.store = store
+    chunks = await run_interrupted_stream(
+        app, "2.4", disconnect=False, block=False, expect_failure=True
+    )
+    assert chunks
+    assert not store.open
 
 
 async def test_oversized_page_stops_reading_at_the_byte_budget(app, settings, monkeypatch):

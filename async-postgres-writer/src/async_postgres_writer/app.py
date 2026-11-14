@@ -4,15 +4,17 @@ from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from dataclasses import asdict
 from email.message import Message
+from importlib.resources import files
+from pathlib import Path
 from secrets import compare_digest
 from typing import Annotated
 from uuid import UUID
 
 import asyncpg
+import yaml
 from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request
 from fastapi.encoders import jsonable_encoder
 from fastapi.responses import JSONResponse, Response, StreamingResponse
-from pydantic import BaseModel
 from starlette.requests import ClientDisconnect
 from starlette.types import Message as ASGIMessage
 from starlette.types import Receive, Scope, Send
@@ -23,27 +25,6 @@ from .writer import MAX_PAGE_BYTES, Store, WriterError
 _NO_STORE = {"Cache-Control": "no-store"}
 _NDJSON = "application/x-ndjson"
 _NDJSON_CHUNK_BYTES = 128 * 1024
-
-
-class _ResultRow(BaseModel):
-    row_number: int
-    data: dict[str, object]
-
-
-class _ResultPageBase(BaseModel):
-    upload_id: UUID
-    row_count: int
-    limit: int
-    rows: list[_ResultRow]
-
-
-class _ResultPage(_ResultPageBase):
-    offset: int
-
-
-class _KeysetResultPage(_ResultPageBase):
-    after_row_number: int
-    next_after_row_number: int | None
 
 
 class _ResultStream(StreamingResponse):
@@ -136,6 +117,22 @@ def create_app(settings: Settings | None = None, *, store_type: type[Store] = St
 
     app = FastAPI(title="Async PostgreSQL Stream Writer", lifespan=lifespan)
 
+    def openapi() -> dict:
+        if app.openapi_schema is None:
+            filename = "stream-writer.v1.yaml"
+            contract = files("async_postgres_writer").joinpath(filename)
+            if not contract.is_file():
+                # Editable installs read the same file directly from the checkout.
+                contract = Path(__file__).resolve().parents[2] / "openapi" / filename
+            schema = yaml.safe_load(contract.read_text(encoding="utf-8"))
+            if not store_type.supports_result_reads:
+                del schema["paths"]["/v1/uploads/{upload_id}/rows"]
+                del schema["paths"]["/v1/uploads/{upload_id}/rows/stream"]
+            app.openapi_schema = schema
+        return app.openapi_schema
+
+    app.openapi = openapi
+
     async def authenticate(authorization: Annotated[str | None, Header()] = None) -> None:
         scheme, _, token = (authorization or "").partition(" ")
         expected = settings.api_token.get_secret_value().encode("ascii")
@@ -204,7 +201,6 @@ def create_app(settings: Settings | None = None, *, store_type: type[Store] = St
         @app.get(
             "/v1/uploads/{upload_id}/rows",
             dependencies=[Depends(authenticate)],
-            response_model=_ResultPage | _KeysetResultPage,
         )
         async def result_page(
             upload_id: UUID,
@@ -237,12 +233,6 @@ def create_app(settings: Settings | None = None, *, store_type: type[Store] = St
         @app.get(
             "/v1/uploads/{upload_id}/rows/stream",
             dependencies=[Depends(authenticate)],
-            responses={
-                200: {
-                    "content": {_NDJSON: {}},
-                    "headers": {"X-Row-Count": {"schema": {"type": "integer"}}},
-                }
-            },
             response_class=Response,
         )
         async def result_stream(upload_id: UUID, request: Request) -> Response:

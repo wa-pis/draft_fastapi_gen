@@ -9,6 +9,7 @@ ENV UV_LINK_MODE=copy \
 WORKDIR /app
 COPY --from=uv /uv /usr/local/bin/uv
 COPY pyproject.toml uv.lock README.md ./
+COPY openapi ./openapi
 COPY src ./src
 RUN uv sync --locked --no-dev --no-editable
 
