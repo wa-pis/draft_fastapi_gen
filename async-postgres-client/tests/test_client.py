@@ -263,6 +263,8 @@ async def test_export_reassembles_large_utf8_record_and_yields_before_eof():
         ([LINE], "0", "application/x-ndjson", 1024),
         ([LINE[:-1]], "1", "application/x-ndjson", 1024),
         ([b"invalid\n"], "1", "application/x-ndjson", 1024),
+        ([b"\xef\xbb\xbf" + LINE], "1", "application/x-ndjson", 1024),
+        ([b'{"row_number":1,"data":{"n":NaN}}\n'], "1", "application/x-ndjson", 1024),
         ([b'{"row_number":1,"data":{"text":"\xff"}}\n'], "1", "application/x-ndjson", 1024),
         ([LINE[:12], LINE[12:]], "1", "application/x-ndjson", len(LINE) - 2),
     ],
@@ -274,6 +276,30 @@ async def test_invalid_or_incomplete_exports_raise(parts, count, media_type, lim
             async with api.stream_upload_rows(ID) as rows:
                 _ = [row async for row in rows]
     assert body.closed
+
+
+async def test_export_yields_rows_at_byte_limit_before_rejecting_oversize_tail():
+    next_line = LINE.replace(b":1", b":2")
+    body = ResponseBody([LINE[:-1], b"\n" + next_line + b"x" * len(LINE)])
+    async with (
+        client(export(body, "3"), max_record_bytes=len(LINE) - 1) as api,
+        api.stream_upload_rows(ID) as rows,
+    ):
+        assert await anext(rows) == ResultRow(1, {})
+        assert await anext(rows) == ResultRow(2, {})
+        with pytest.raises(ProtocolError, match="exceeds its byte limit"):
+            await anext(rows)
+    assert body.closed
+
+
+async def test_export_preserves_large_integers_and_exact_decimals():
+    body = ResponseBody(
+        [b'{"row_number":1,"data":{"integer":1' + b"0" * 5000 + b',"decimal":1e400}}\n']
+    )
+    async with client(export(body)) as api, api.stream_upload_rows(ID) as rows:
+        assert [row async for row in rows] == [
+            ResultRow(1, {"integer": 10**5000, "decimal": Decimal("1e400")})
+        ]
 
 
 async def test_early_exit_closes_response_without_consuming_remaining_rows():

@@ -58,3 +58,40 @@ JSON. Это же делал [клиент предыдущего замера](
 API берите из `VmHWM` процесса; для PostgreSQL во время каждого прогона
 снимайте `memory.current` контейнера (включая кэш страниц) и сумму `RssAnon`
 серверных процессов роли приложения, чтобы не складывать общую память.
+
+## Сравнение разбора NDJSON до и после оптимизации
+
+Для [сравнения двух версий](results/2026-11-15-compose-pg17-ndjson-parser-9m.json)
+используйте те же 9 млн строк и настройки Compose. Обе версии запускаются
+одним скриптом и в одной виртуальной среде; `PYTHONPATH` выбирает исходники
+SDK. После серии 1 → 2 → 4 для базовой версии и 4 → 2 → 1 для оптимизированной
+повторите пару на четырёх потоках в обратном порядке. Перед каждым прогоном
+пересоздавайте контейнер API; том
+PostgreSQL сохраняйте, кэш ОС не сбрасывайте. Серверные метрики снимайте по
+методике выше вокруг клиентской команды.
+
+Из `async-postgres-writer`, в той же сессии Bash с подготовленным стендом:
+
+```bash
+set -euo pipefail
+out=$(mktemp -d)
+mkdir "$out/baseline"
+git -C .. archive 6b57ee50ad33dd94e28b05c5bd69e65bfde2f4e4 async-postgres-client/src |
+  tar -x -C "$out/baseline"
+for label in before-1 before-2 before-4 after-4 after-2 after-1 after-4-repeat before-4-repeat; do
+  sdk_src=../async-postgres-client/src
+  if [[ "$label" == before-* ]]; then
+    sdk_src="$out/baseline/async-postgres-client/src"
+  fi
+  "${c[@]}" up -d --wait --no-build --no-deps --force-recreate writer
+  url="http://$("${c[@]}" port writer 8080)"
+  readers=${label#*-}
+  PYTHONPATH="$sdk_src" ../async-postgres-client/.venv/bin/python \
+    ../async-postgres-client/benchmarks/read_load.py --url "$url" --label "$label" \
+    --upload-id 90000000-0000-4000-8000-000000000001 --concurrency "${readers%%-*}" \
+    --expected-bytes 2341158725 \
+    --expected-sha256 4b970bbbd31fd195642cf6ac2ed5e12864aa108b57db05b76bcd9f976d9b2f8f \
+    --output "$out/$label.json"
+done
+printf 'Отчёты: %s\n' "$out"
+```
