@@ -22,9 +22,9 @@ class TypedStore(Store):
         self, conn: asyncpg.Connection, upload_id: UUID, stream: NDJSONStream
     ) -> None:
         async def records() -> AsyncIterator[tuple]:
-            async for number, text in stream:
+            async for number, row in stream.decoded_records():
                 try:
-                    yield typed_record(upload_id, number, text)
+                    yield typed_record(upload_id, number, row)
                 except ValueError as exc:
                     raise WriterError(400, "invalid_stream", "Invalid typed benchmark row") from exc
 

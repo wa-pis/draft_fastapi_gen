@@ -4,6 +4,7 @@ import json
 import re
 from collections.abc import AsyncIterable, AsyncIterator
 from decimal import Decimal, DecimalException
+from typing import Literal, overload
 
 from .errors import WriterError
 
@@ -23,7 +24,7 @@ def _constant(value: str) -> None:
     raise ValueError("Non-finite JSON number")
 
 
-def _validate(line: bytes) -> str:
+def _validate(line: bytes, decoded: bool) -> str | dict[str, object]:
     try:
         text = line.decode("utf-8")
         value = json.loads(
@@ -46,7 +47,7 @@ def _validate(line: bytes) -> str:
                 raise ValueError("String unsupported by JSONB")
     except (ValueError, UnicodeError, RecursionError, DecimalException) as exc:
         raise WriterError(400, "invalid_stream", "Each line must be a valid JSON object") from exc
-    return text
+    return value if decoded else text
 
 
 class NDJSONStream:
@@ -70,7 +71,20 @@ class NDJSONStream:
     def sha256(self) -> str:
         return self._digest.hexdigest()
 
-    async def __aiter__(self) -> AsyncIterator[tuple[int, str]]:
+    def __aiter__(self) -> AsyncIterator[tuple[int, str]]:
+        return self._iterate(False)
+
+    def decoded_records(self) -> AsyncIterator[tuple[int, dict[str, object]]]:
+        """Consume the stream as validated JSON objects instead of original text."""
+        return self._iterate(True)
+
+    @overload
+    def _iterate(self, decoded: Literal[False]) -> AsyncIterator[tuple[int, str]]: ...
+
+    @overload
+    def _iterate(self, decoded: Literal[True]) -> AsyncIterator[tuple[int, dict[str, object]]]: ...
+
+    async def _iterate(self, decoded: bool) -> AsyncIterator[tuple[int, str | dict[str, object]]]:
         pending = bytearray()
         source = aiter(self.chunks)
         while True:
@@ -97,19 +111,19 @@ class NDJSONStream:
                 pending.extend(chunk[start:stop])
                 if end < 0:
                     break
-                yield self._record(pending)
+                yield self._record(pending, decoded)
                 pending.clear()
                 start = end + 1
         if pending:
-            yield self._record(pending)
+            yield self._record(pending, decoded)
         if self.row_count == 0:
             raise WriterError(400, "invalid_stream", "Upload must contain at least one JSON object")
 
-    def _record(self, line: bytearray) -> tuple[int, str]:
+    def _record(self, line: bytearray, decoded: bool) -> tuple[int, str | dict[str, object]]:
         if line.endswith(b"\r"):
             line = line[:-1]
         if len(line) > self.max_line_bytes:
             raise WriterError(413, "line_too_large", "A record exceeds the byte limit")
-        text = _validate(bytes(line))
+        record = _validate(bytes(line), decoded)
         self.row_count += 1
-        return self.row_count, text
+        return self.row_count, record
