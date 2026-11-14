@@ -4,6 +4,9 @@
 через `asyncpg` и `COPY`. Весь результат и receipt фиксируются одной транзакцией.
 Приложение не связано с Kafka worker или Hadoop writer и имеет собственные зависимости.
 
+[Примеры на psycopg 3, asyncpg и SQLAlchemy](examples/postgres_io/README.md): пакетная
+запись, чтение через `LIMIT/OFFSET`, потоковое чтение и запись через `COPY`, HTTP-клиент.
+
 ## Контракт
 
 ```text
