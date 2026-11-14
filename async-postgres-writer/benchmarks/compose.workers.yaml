@@ -1,0 +1,19 @@
+services:
+  writer:
+    entrypoint: ["/app/.venv/bin/python", "-m", "uvicorn"]
+    command:
+      - benchmarks.worker_app:create_worker_app
+      - --factory
+      - --host
+      - 0.0.0.0
+      - --port
+      - "8080"
+      - --workers
+      - ${BENCHMARK_UVICORN_WORKERS:?Set worker count}
+      - --timeout-keep-alive
+      - "120"
+    environment:
+      BENCHMARK_LAYOUT: ${BENCHMARK_LAYOUT:?Set jsonb or columns}
+      WRITER_DATABASE_URL: postgresql://benchmark_writer:${BENCHMARK_WRITER_PASSWORD:?Required}@postgres:5432/stream_writer?application_name=stream_writer_benchmark
+    volumes:
+      - ./benchmarks:/app/benchmarks:ro

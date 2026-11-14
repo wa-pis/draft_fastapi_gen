@@ -2,6 +2,7 @@ import asyncio
 import hashlib
 import json
 import sys
+from contextlib import AsyncExitStack
 from importlib.util import module_from_spec, spec_from_file_location
 from pathlib import Path
 from uuid import uuid4
@@ -59,6 +60,108 @@ async def test_parallel_uploads_overlap_and_verify_each_receipt(concurrency):
     ]
 
 
+async def test_worker_connections_are_balanced_and_rejected_clients_close(monkeypatch):
+    original_client = httpx.AsyncClient
+    url = "http://benchmark.test"
+    pids = iter((101, 101, 101, 102, 102))
+    opened = []
+
+    def open_client(**kwargs):
+        pid = next(pids)
+
+        def ready(request):
+            assert str(request.url) == f"{url}/health/ready"
+            return httpx.Response(200, headers={benchmark.WORKER_PID_HEADER: str(pid)})
+
+        candidate = original_client(transport=httpx.MockTransport(ready), **kwargs)
+        opened.append(candidate)
+        return candidate
+
+    monkeypatch.setattr(benchmark.httpx, "AsyncClient", open_client)
+    async with AsyncExitStack() as stack:
+        selected = await benchmark.warm_worker_clients(stack, url, {}, 4, 2)
+        assert selected == [
+            (101, opened[0]),
+            (102, opened[3]),
+            (101, opened[1]),
+            (102, opened[4]),
+        ]
+        assert opened[2].is_closed
+        assert not any(client.is_closed for _, client in selected)
+    assert all(client.is_closed for client in opened)
+
+
+async def test_worker_fallback_probes_concurrently_and_closes_extras(monkeypatch):
+    original_client = httpx.AsyncClient
+    opened = []
+    burst = asyncio.Event()
+    live_probes = 0
+
+    def open_client(**kwargs):
+        async def health(request):
+            nonlocal live_probes
+            if request.url.path == "/health/ready":
+                assert live_probes == 0
+            else:
+                assert request.url.path == "/health/live"
+                live_probes += 1
+                if live_probes == 2:
+                    burst.set()
+                # No liveness response can identify the second worker until a peer starts.
+                await burst.wait()
+            pid = 101 if request.url.path == "/health/ready" else 102
+            return httpx.Response(200, headers={benchmark.WORKER_PID_HEADER: str(pid)})
+
+        candidate = original_client(transport=httpx.MockTransport(health), **kwargs)
+        opened.append(candidate)
+        return candidate
+
+    monkeypatch.setattr(benchmark.httpx, "AsyncClient", open_client)
+    async with AsyncExitStack() as stack, asyncio.timeout(2):
+        selected = await benchmark.warm_worker_clients(stack, "http://benchmark.test", {}, 2, 2)
+        assert [pid for pid, _ in selected] == [101, 102]
+        assert {client for client in opened if not client.is_closed} == {
+            client for _, client in selected
+        }
+    assert all(client.is_closed for client in opened)
+
+
+@pytest.mark.parametrize("reported_pid", [101, 102])
+async def test_timed_upload_verifies_worker_pid(reported_pid):
+    upload_id = uuid4()
+    payload = b'{"n":1}\n'
+    sha = hashlib.sha256(payload).hexdigest()
+
+    async def body(digest, label):
+        digest.update(payload)
+        yield payload
+
+    def put(request):
+        assert request.method == "PUT" and request.content == payload
+        return httpx.Response(
+            201,
+            headers={benchmark.WORKER_PID_HEADER: str(reported_pid)},
+            json={
+                "upload_id": str(upload_id),
+                "byte_count": len(payload),
+                "row_count": 1,
+                "sha256": sha,
+                "reused": False,
+            },
+        )
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(put), base_url="http://benchmark.test"
+    ) as dedicated:
+        args = (None, {}, [upload_id], body, len(payload), 1)
+        if reported_pid != 101:
+            with pytest.raises(RuntimeError, match="expected worker 101, got 102"):
+                await benchmark.upload_batch(*args, workers=[(101, dedicated)])
+        else:
+            uploads, _, _ = await benchmark.upload_batch(*args, workers=[(101, dedicated)])
+            assert uploads[0]["worker_pid"] == 101
+
+
 async def test_activity_counts_overlapping_copies_across_wait_event_groups():
     stop = asyncio.Event()
     result = benchmark.activity_result()
@@ -95,6 +198,8 @@ async def test_activity_counts_overlapping_copies_across_wait_event_groups():
             ]
 
     await benchmark.sample_activity(Monitor(), stop, result, pids)
+    assert result["peak_app_backends"] == 4
+    assert result["app_backend_histogram"] == {"4": 1}
     assert result["peak_active_copy_backends"] == 3
     assert result["active_copy_backend_histogram"] == {"3": 1}
     assert pids == {101, 102, 103, 104}
@@ -145,7 +250,11 @@ def test_cli_preserves_fixed_upload_id_order(monkeypatch, tmp_path):
     benchmark.main()
     assert json.loads(output.read_text())["upload_ids"] == [str(first), str(second)]
 
-    for invalid in (["--upload-id", str(first)], ["--upload-id", str(first)] * 2):
+    for invalid in (
+        ["--upload-id", str(first)],
+        ["--upload-id", str(first)] * 2,
+        ["--uvicorn-workers", "4"],
+    ):
         monkeypatch.setattr(sys, "argv", [*argv, *invalid])
         with pytest.raises(SystemExit) as error:
             benchmark.main()
