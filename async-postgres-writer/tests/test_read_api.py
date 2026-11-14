@@ -48,6 +48,8 @@ async def test_read_routes_require_auth_before_accessing_the_store(app, path):
         ("limit=hello", "limit"),
         ("offset=-1", "offset"),
         ("offset=9223372036854775808", "offset"),
+        ("after_row_number=-1", "after_row_number"),
+        ("after_row_number=9223372036854775808", "after_row_number"),
     ],
 )
 async def test_page_rejects_invalid_pagination_before_accessing_the_store(app, query, parameter):
@@ -107,7 +109,7 @@ async def test_initial_cursor_failure_returns_503_before_any_stream_headers(app)
     assert response.json()["error"] == "database_unavailable"
 
 
-async def run_interrupted_stream(app, spec_version, *, disconnect=True):
+async def run_interrupted_stream(app, spec_version, *, disconnect=True, block=True):
     """ASGITransport buffers responses and cannot simulate a failed socket write."""
     path = f"{ROWS}/stream"
     scope = {
@@ -134,6 +136,8 @@ async def run_interrupted_stream(app, spec_version, *, disconnect=True):
     async def send(message):
         sent.append(message)
         if message["type"] == "http.response.body" and message.get("more_body"):
+            if not block:
+                return
             first_body.set()
             if disconnect and spec_version == "2.4":
                 raise OSError("client disconnected during a send")
@@ -145,14 +149,18 @@ async def run_interrupted_stream(app, spec_version, *, disconnect=True):
                 await app(scope, receive, send)
             except (OSError, ClientDisconnect):
                 assert spec_version == "2.4"
-        else:
+        elif block:
             with pytest.raises(RuntimeError):
                 await app(scope, receive, send)
+        else:
+            await app(scope, receive, send)
 
     assert sent[0]["type"] == "http.response.start"
     assert sent[0]["status"] == 200
-    assert first_body.is_set()
-    assert not any(m["type"] == "http.response.body" and not m.get("more_body") for m in sent)
+    assert first_body.is_set() == block
+    finished = any(m["type"] == "http.response.body" and not m.get("more_body") for m in sent)
+    assert finished != block
+    return [m["body"] for m in sent if m["type"] == "http.response.body" and m.get("more_body")]
 
 
 class StreamStore:
@@ -164,7 +172,7 @@ class StreamStore:
         self.open = True
 
         async def rows():
-            yield '{"row_number":1,"data":{"value":1}}'
+            yield '{"row_number":1,"data":{"value":"' + "x" * (128 * 1024) + '"}}'
             pytest.fail("the server should stop reading when the client stops receiving")
 
         try:
@@ -183,6 +191,30 @@ async def test_interruption_closes_stream_context(app, settings, spec_version, d
     await run_interrupted_stream(app, spec_version, disconnect=disconnect)
 
     assert not store.open
+
+
+async def test_export_batches_small_rows_and_preserves_wide_utf8_rows(app):
+    rows = [
+        '{"row_number":1,"data":{"value":"é"}}',
+        '{"row_number":2,"data":{"value":2}}',
+        '{"row_number":3,"data":{"value":"' + "я" * (128 * 1024) + '"}}',
+        '{"row_number":4,"data":{"value":4}}',
+    ]
+
+    class BatchStore:
+        @asynccontextmanager
+        async def stream_rows(self, _):
+            async def records():
+                for row in rows:
+                    yield row
+
+            yield len(rows), records()
+
+    app.state.store = BatchStore()
+    chunks = await run_interrupted_stream(app, "2.4", disconnect=False, block=False)
+    assert chunks[0] == ("\n".join(rows[:2]) + "\n").encode()
+    assert max(map(len, chunks)) == 128 * 1024
+    assert b"".join(chunks) == ("\n".join(rows) + "\n").encode()
 
 
 async def test_oversized_page_stops_reading_at_the_byte_budget(app, settings, monkeypatch):

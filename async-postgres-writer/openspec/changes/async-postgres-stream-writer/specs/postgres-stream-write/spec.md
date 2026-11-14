@@ -78,8 +78,14 @@ UUID сервис SHALL возвращать `404`. API SHALL использов
 - **AND** при смещении за пределами результата сервис возвращает `200` с пустым массивом
 
 #### Scenario: Reject invalid pagination
-- **WHEN** `limit` или `offset` не являются целыми числами допустимого диапазона
+- **WHEN** `limit`, `offset` или `after_row_number` не являются целыми числами допустимого диапазона либо клиент одновременно передаёт `after_row_number` и `offset` (включая `offset=0`)
 - **THEN** сервис возвращает `422`
+
+#### Scenario: Read rows after a known row number
+- **WHEN** клиент запрашивает страницу с `after_row_number` от 0 до `9223372036854775807` и без `offset`
+- **THEN** сервис возвращает упорядоченные строки с `row_number > after_row_number` через диапазон существующего ключа `(upload_id, row_number)`
+- **AND** JSON содержит `upload_id`, `row_count`, `limit`, `rows`, `after_row_number` и `next_after_row_number`: номер последней строки страницы, если есть следующая страница, иначе `null`
+- **AND** запросы без `after_row_number` сохраняют формат ответа с `offset`
 
 #### Scenario: Reject an oversized page
 - **WHEN** сериализованное тело JSON-страницы превышает 16 МиБ
@@ -88,6 +94,7 @@ UUID сервис SHALL возвращать `404`. API SHALL использов
 #### Scenario: Stream an upload with bounded resources
 - **WHEN** клиент запрашивает `GET /v1/uploads/{upload_id}/rows/stream`
 - **THEN** сервис отдаёт `application/x-ndjson` с `X-Row-Count`, по одному объекту с `row_number` и `data` на строку, без накопления всего результата в памяти
+- **AND** сервис отправляет тело порциями не более 128 КиБ, сохраняя содержимое и порядок строк, даже если отдельная строка разбита между порциями
 - **AND** сервис ограничивает общее время потоковой выгрузки, включая передачу ответа, и освобождает соединение при её завершении или прерывании
 
 #### Scenario: Database fails before streaming begins

@@ -99,6 +99,47 @@ wait "$server_pid"
 GET по UUID из отчёта и проверить число строк. Удаление выделенной базы выполняется
 отдельно после проверки.
 
+## Чтение 9 млн строк: пагинация и поток NDJSON
+
+`read_load.py` сравнивает HTTP-чтение старой и новой версией приложения на одной базе.
+Создайте **пустую выделенную** PostgreSQL, инициализируйте схему и наполните её:
+
+```bash
+.venv/bin/async-postgres-writer init-db
+export WRITER_TEST_DATABASE_URL="$WRITER_DATABASE_URL"
+upload_id=90000000-0000-4000-8000-000000000001
+.venv/bin/python benchmarks/read_load.py seed --upload-id "$upload_id"
+```
+
+Тестовый JSONB создаётся SQL в одной транзакции, без PUT. У тестовой квитанции нет
+исходного файла, поэтому `byte_count=0` и SHA-256 из нулей; скрипт проверяет SHA-256
+фактического экспорта отдельно. Размер строки этого набора меньше 4 КиБ, использованных
+в замерах записи. Перед запуском проверьте запас под таблицу и WAL.
+
+Запускайте по одной версии за раз на одинаковых настройках. В `BASE_URL` и `NEW_URL`
+укажите адреса своих экземпляров, а в `WRITER_API_TOKEN` — их общий токен:
+
+```bash
+.venv/bin/python benchmarks/read_load.py measure --url "$BASE_URL" \
+  --upload-id "$upload_id" --label baseline --stream-only --output /tmp/read-baseline.json
+.venv/bin/python benchmarks/read_load.py measure --url "$NEW_URL" \
+  --upload-id "$upload_id" --label candidate --stream-only \
+  --compare-stream /tmp/read-baseline.json --output /tmp/read-candidate.json
+.venv/bin/python benchmarks/read_load.py measure --url "$BASE_URL" \
+  --upload-id "$upload_id" --label pages-baseline --pages-only --page-limit 100 --page-repeats 5
+.venv/bin/python benchmarks/read_load.py measure --url "$NEW_URL" \
+  --upload-id "$upload_id" --label pages-candidate --pages-only --keyset --page-limit 100 --page-repeats 5
+```
+
+Клиент измеряет время до первых байтов и до конца тела, скорость, CPU и пиковый RSS.
+Он считает строки и SHA-256 из входящих порций, без сохранения всего файла. Для
+API и PostgreSQL измеряйте суммарные секунды CPU за один экспорт и пиковый RSS;
+на Docker CPU берётся как дельта `usage_usec` из `cpu.stat`, RSS процесса — из
+`/proc/*/status`. RSS процесса PostgreSQL включает отображённую общую память.
+Для повторного сравнения перезапускайте только приложение между выгрузками,
+оставляя тот же том PostgreSQL. В [замере на 9 млн строк](../VALIDATION.md#чтение-9-млн-строк-after_row_number-и-порции-ndjson-по-128-киб)
+порядок версий был A–B–B–A.
+
 ## Через Docker Compose с PostgreSQL 17
 
 Запустите Docker и [Compose 2.24.4+](https://docs.docker.com/reference/compose-file/merge/#replace-value)
