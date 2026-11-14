@@ -49,14 +49,16 @@ def _reject_constant(value: str) -> None:
     raise ValueError(f"Invalid JSON constant: {value}")
 
 
+_JSON_DECODER = json.JSONDecoder(
+    parse_float=Decimal,
+    parse_int=_decode_integer,
+    parse_constant=_reject_constant,
+)
+
+
 def _object(raw: bytes | bytearray) -> dict[str, JSONValue]:
     try:
-        value = json.loads(
-            raw.decode("utf-8"),
-            parse_float=Decimal,
-            parse_int=_decode_integer,
-            parse_constant=_reject_constant,
-        )
+        value = _JSON_DECODER.decode(raw.decode("utf-8"))
     except (ValueError, InvalidOperation, RecursionError):
         raise ProtocolError("Expected a UTF-8 JSON object") from None
     if not isinstance(value, dict):
@@ -162,11 +164,14 @@ async def _stream_rows(
             stop = len(chunk) if end < 0 else end
             if len(record) + stop - start > max_record_bytes:
                 raise ProtocolError("NDJSON record exceeds its byte limit")
-            record.extend(memoryview(chunk)[start:stop])
-            if end < 0:
-                break
-            row = _row(_object(record))
-            record.clear()
+            if record or end < 0:
+                record.extend(memoryview(chunk)[start:stop])
+                if end < 0:
+                    break
+                row = _row(_object(record))
+                record.clear()
+            else:
+                row = _row(_object(chunk[start:end]))
             count += 1
             if count > expected_rows or row.row_number <= last_row:
                 raise ProtocolError("Unexpected row count or order in NDJSON response")
