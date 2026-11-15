@@ -1,14 +1,14 @@
 import asyncio
 import hashlib
 from collections.abc import AsyncIterable, AsyncIterator
-from contextlib import asynccontextmanager
+from contextlib import aclosing, asynccontextmanager
 from dataclasses import dataclass, replace
 from datetime import datetime
 from uuid import UUID
 
 import asyncpg
 
-from .config import Settings
+from .config import MAX_EXPORT_PREFETCH_ROWS, Settings
 from .errors import WriterError
 from .stream import NDJSONStream
 
@@ -23,6 +23,7 @@ _EXPORT_ROWS_AFTER = (
 )
 _READ_ERRORS = (asyncpg.PostgresError, asyncpg.InterfaceError, OSError, TimeoutError)
 _PAGE_PREFETCH = 8
+_EXPORT_FETCH_TARGET_BYTES = 2 * 1024**2
 MAX_PAGE_BYTES = 16 * 1024**2
 
 
@@ -38,6 +39,22 @@ class Receipt:
 
 def _receipt(row: asyncpg.Record) -> Receipt:
     return Receipt(**dict(row))
+
+
+async def _adaptive_export_rows(conn: asyncpg.Connection, upload_id: UUID) -> AsyncIterator[str]:
+    cursor = await conn.cursor(_EXPORT_ROWS, upload_id)
+    prefetch = 1
+    while batch := await cursor.fetch(prefetch):
+        widest = 0
+        for row in batch:
+            record = row[0]
+            size = (len(record) if record.isascii() else len(record.encode("utf-8"))) + 1
+            if size > widest:
+                widest = size
+            yield record
+        del batch
+        # shortcut: next batch size is an estimate; use byte-limited DB reads for a hard cap.
+        prefetch = max(1, min(MAX_EXPORT_PREFETCH_ROWS, _EXPORT_FETCH_TARGET_BYTES // widest))
 
 
 class Store:
@@ -117,10 +134,14 @@ class Store:
     @asynccontextmanager
     async def stream_rows(self, upload_id: UUID) -> AsyncIterator[tuple[int, AsyncIterator[str]]]:
         async with self._committed_read(upload_id) as (conn, total):
-            cursor = conn.cursor(
-                _EXPORT_ROWS, upload_id, prefetch=self.settings.export_prefetch_rows
-            )
-            yield total, (row[0] async for row in cursor)
+            if self.settings.export_prefetch_adaptive:
+                async with aclosing(_adaptive_export_rows(conn, upload_id)) as rows:
+                    yield total, rows
+            else:
+                cursor = conn.cursor(
+                    _EXPORT_ROWS, upload_id, prefetch=self.settings.export_prefetch_rows
+                )
+                yield total, (row[0] async for row in cursor)
 
     async def write(self, upload_id: UUID, chunks: AsyncIterable[bytes]) -> Receipt:
         settings = self.settings

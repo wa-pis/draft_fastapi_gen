@@ -1,5 +1,6 @@
 import asyncio
 from contextlib import asynccontextmanager
+from itertools import islice
 from uuid import UUID
 
 import httpx
@@ -9,7 +10,7 @@ from starlette.requests import ClientDisconnect
 
 from async_postgres_writer.app import create_app
 from async_postgres_writer.config import Settings
-from async_postgres_writer.writer import Store, WriterError
+from async_postgres_writer.writer import Store, WriterError, _adaptive_export_rows
 
 TOKEN = "a" * 32
 AUTH = {"Authorization": f"Bearer {TOKEN}"}
@@ -219,6 +220,30 @@ async def test_export_batches_small_rows_and_preserves_wide_utf8_rows(app):
     assert chunks[0] == ("\n".join(rows[:2]) + "\n").encode()
     assert max(map(len, chunks)) == 128 * 1024
     assert b"".join(chunks) == ("\n".join(rows) + "\n").encode()
+
+
+async def test_adaptive_prefetch_uses_widest_utf8_row_and_recovers_after_a_wide_batch():
+    narrow = '{"data":{}}'
+    wide = '{"data":"' + "я" * (384 * 1024) + '"}'
+    expected = [narrow, wide, *([narrow] * 34)]
+    records = iter((record,) for record in expected)
+    requested = []
+
+    class Cursor:
+        async def fetch(self, count):
+            requested.append(count)
+            return list(islice(records, count))
+
+    class Connection:
+        async def cursor(self, _, upload_id):
+            assert upload_id == UPLOAD_ID
+            return Cursor()
+
+    rows = _adaptive_export_rows(Connection(), UPLOAD_ID)
+    assert await anext(rows) == narrow
+    assert requested == [1]
+    assert [row async for row in rows] == expected[1:]
+    assert requested[:4] == [1, 32, 2, 32]
 
 
 async def test_database_failure_after_first_chunk_cannot_complete_export(app):

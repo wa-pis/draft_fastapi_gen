@@ -1,6 +1,8 @@
 from pydantic import Field, SecretStr, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
+MAX_EXPORT_PREFETCH_ROWS = 32
+
 
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(env_prefix="WRITER_", hide_input_in_errors=True)
@@ -8,7 +10,8 @@ class Settings(BaseSettings):
     database_url: SecretStr
     api_token: SecretStr
     pool_size: int = Field(default=4, ge=1, le=32)
-    export_prefetch_rows: int = Field(default=8, ge=1, le=32)
+    export_prefetch_rows: int = Field(default=8, ge=1, le=MAX_EXPORT_PREFETCH_ROWS)
+    export_prefetch_adaptive: bool = False
     max_upload_bytes: int = Field(default=5 * 1024**3, ge=1)
     max_line_bytes: int = Field(default=1024**2, ge=1)
     upload_timeout_seconds: float = Field(default=3600, gt=0, allow_inf_nan=False)
