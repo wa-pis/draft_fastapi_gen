@@ -111,6 +111,7 @@ async def test_pages_and_ndjson_export_match_committed_rows_in_order(read_api):
     assert past_end.json()["rows"] == []
 
     app.state.store.settings.export_prefetch_rows = 8
+    app.state.store.settings.export_prefetch_adaptive = False
     baseline = await client.get(f"{upload_path}/rows/stream", headers=AUTH)
     assert baseline.status_code == 200
     assert baseline.headers["Content-Type"].split(";")[0] == "application/x-ndjson"
@@ -118,11 +119,13 @@ async def test_pages_and_ndjson_export_match_committed_rows_in_order(read_api):
     assert baseline.content.endswith(b"\n")
     assert [decode_json(line) for line in baseline.content.splitlines()] == expected
 
-    app.state.store.settings.export_prefetch_rows = 32
-    tuned = await client.get(f"{upload_path}/rows/stream", headers=AUTH)
-    assert tuned.status_code == 200
-    assert tuned.headers == baseline.headers
-    assert tuned.content == baseline.content
+    for prefetch, adaptive in ((32, False), (8, True)):
+        app.state.store.settings.export_prefetch_rows = prefetch
+        app.state.store.settings.export_prefetch_adaptive = adaptive
+        tuned = await client.get(f"{upload_path}/rows/stream", headers=AUTH)
+        assert tuned.status_code == 200
+        assert tuned.headers == baseline.headers
+        assert tuned.content == baseline.content
 
 
 async def test_keyset_handles_row_number_gaps_and_an_exact_final_page(read_api):
