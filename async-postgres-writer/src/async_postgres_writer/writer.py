@@ -21,6 +21,32 @@ _EXPORT_ROWS_AFTER = (
     f"SELECT {_EXPORT_RECORD}, row_number FROM stream_writer.rows "
     "WHERE upload_id = $1 AND row_number > $2 ORDER BY row_number LIMIT $3"
 )
+_EXPORT_LINE = f"convert_to({_EXPORT_RECORD} || chr(10), 'UTF8')"
+_EXPORT_BYTE_BATCH = f"""
+    WITH RECURSIVE batch (row_number, position, body, total_bytes) AS (
+        VALUES ($2::bigint, 0, NULL::bytea, 0::bigint)
+        UNION ALL
+        SELECT r.row_number, b.position + 1, r.body, b.total_bytes + octet_length(r.body)
+        FROM batch AS b
+        CROSS JOIN LATERAL (
+            SELECT row_number, {_EXPORT_LINE} AS body
+            FROM stream_writer.rows
+            WHERE upload_id = $1 AND row_number > b.row_number
+            ORDER BY row_number LIMIT 1
+        ) AS r
+        WHERE b.position < $3 AND b.total_bytes < $4::integer
+    )
+    SELECT row_number,
+           CASE WHEN total_bytes > $4 THEN substring(body FOR $4) ELSE body END AS body,
+           octet_length(body) AS row_bytes
+    FROM batch
+    WHERE position > 0 AND (total_bytes <= $4 OR position = 1)
+    ORDER BY position
+"""
+_EXPORT_LINE_SLICE = f"""
+    SELECT substring({_EXPORT_LINE} FROM $3 FOR $4)
+    FROM stream_writer.rows WHERE upload_id = $1 AND row_number = $2
+"""
 _READ_ERRORS = (asyncpg.PostgresError, asyncpg.InterfaceError, OSError, TimeoutError)
 _PAGE_PREFETCH = 8
 _EXPORT_FETCH_TARGET_BYTES = 2 * 1024**2
@@ -55,6 +81,31 @@ async def _adaptive_export_rows(conn: asyncpg.Connection, upload_id: UUID) -> As
         del batch
         # shortcut: next batch size is an estimate; use byte-limited DB reads for a hard cap.
         prefetch = max(1, min(MAX_EXPORT_PREFETCH_ROWS, _EXPORT_FETCH_TARGET_BYTES // widest))
+
+
+async def _byte_limited_export_rows(
+    conn: asyncpg.Connection, upload_id: UUID
+) -> AsyncIterator[str]:
+    last_row = 0
+    max_rows = 1
+    budget = _EXPORT_FETCH_TARGET_BYTES
+    while batch := await conn.fetch(_EXPORT_BYTE_BATCH, upload_id, last_row, max_rows, budget):
+        for last_row, body, row_bytes in batch:
+            if len(body) < row_bytes:
+                # shortcut: assemble a single oversized row until the HTTP iterator accepts fragments.
+                full_row = bytearray(body)
+                while len(full_row) < row_bytes:
+                    fragment = await conn.fetchval(
+                        _EXPORT_LINE_SLICE, upload_id, last_row, len(full_row) + 1, budget
+                    )
+                    if not fragment:
+                        raise RuntimeError("Incomplete export row")
+                    full_row.extend(fragment)
+                body = full_row
+                del full_row, fragment
+            yield body[:-1].decode("utf-8")
+        del batch, body
+        max_rows = MAX_EXPORT_PREFETCH_ROWS
 
 
 class Store:
@@ -134,7 +185,10 @@ class Store:
     @asynccontextmanager
     async def stream_rows(self, upload_id: UUID) -> AsyncIterator[tuple[int, AsyncIterator[str]]]:
         async with self._committed_read(upload_id) as (conn, total):
-            if self.settings.export_prefetch_adaptive:
+            if self.settings.export_prefetch_hard_limit:
+                async with aclosing(_byte_limited_export_rows(conn, upload_id)) as rows:
+                    yield total, rows
+            elif self.settings.export_prefetch_adaptive:
                 async with aclosing(_adaptive_export_rows(conn, upload_id)) as rows:
                     yield total, rows
             else:

@@ -187,12 +187,16 @@ def test_settings_reads_env_and_hides_secrets(monkeypatch):
     monkeypatch.setenv("WRITER_POOL_SIZE", "2")
     monkeypatch.setenv("WRITER_EXPORT_PREFETCH_ROWS", "32")
     monkeypatch.delenv("WRITER_EXPORT_PREFETCH_ADAPTIVE", raising=False)
+    monkeypatch.delenv("WRITER_EXPORT_PREFETCH_HARD_LIMIT", raising=False)
     assert Settings().export_prefetch_adaptive is False
+    assert Settings().export_prefetch_hard_limit is False
     monkeypatch.setenv("WRITER_EXPORT_PREFETCH_ADAPTIVE", "true")
+    monkeypatch.setenv("WRITER_EXPORT_PREFETCH_HARD_LIMIT", "true")
     settings = Settings()
     assert settings.pool_size == 2
     assert settings.export_prefetch_rows == 32
     assert settings.export_prefetch_adaptive is True
+    assert settings.export_prefetch_hard_limit is True
     assert "secret" not in repr(settings)
     assert TOKEN not in repr(settings)
     with pytest.raises(ValidationError) as error:
