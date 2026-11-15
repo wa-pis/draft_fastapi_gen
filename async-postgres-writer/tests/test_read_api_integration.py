@@ -10,6 +10,7 @@ import httpx
 import pytest
 import pytest_asyncio
 
+from async_postgres_writer import writer
 from async_postgres_writer.__main__ import init_db
 from async_postgres_writer.app import create_app
 from async_postgres_writer.config import Settings
@@ -161,6 +162,97 @@ async def test_keyset_handles_row_number_gaps_and_an_exact_final_page(read_api):
         f"{upload_path}/rows", headers=AUTH, params={"offset": 0, "after_row_number": 0}
     )
     assert conflict.status_code == 422
+
+
+async def test_hard_prefetch_caps_pg_results_and_preserves_oversized_unicode(read_api, monkeypatch):
+    client, app, upload_id, _ = read_api
+    budget = 2 * 1024**2
+
+    def line(number, payload):
+        return (
+            json.dumps(
+                {"data": {"payload": payload}, "row_number": number}, ensure_ascii=False
+            ).encode()
+            + b"\n"
+        )
+
+    oversized = "🌊" * (budget // 4 + 1)
+    if line(70, oversized)[budget] & 0xC0 != 0x80:
+        oversized = "x" + oversized
+    oversized_line = line(70, oversized)
+    assert oversized_line[budget] & 0xC0 == 0x80
+
+    rows = [
+        *((number, "") for number in range(1, 66)),
+        *((number, "x" * (768 * 1024)) for number in (66, 67, 68)),
+        (69, "x" * (budget - len(line(69, "")))),
+        (70, oversized),
+        (72, "after the gap"),
+    ]
+    async with app.state.store.pool.acquire() as conn, conn.transaction():
+        await conn.execute(
+            "INSERT INTO stream_writer.uploads (upload_id, sha256, row_count, byte_count) "
+            "VALUES ($1, repeat('0', 64), $2, 0)",
+            upload_id,
+            len(rows),
+        )
+        await conn.copy_records_to_table(
+            "rows",
+            schema_name="stream_writer",
+            columns=("upload_id", "row_number", "data"),
+            records=(
+                (upload_id, number, json.dumps({"payload": payload}, ensure_ascii=False))
+                for number, payload in rows
+            ),
+        )
+
+    batches = []
+    slices = []
+    original = writer._byte_limited_export_rows
+
+    class ProbedConnection:
+        def __init__(self, conn):
+            self.conn = conn
+
+        async def fetch(self, *args):
+            result = await self.conn.fetch(*args)
+            size = sum(len(row["body"]) for row in result)
+            assert size <= budget
+            batches.append(([row["row_number"] for row in result], size))
+            return result
+
+        async def fetchval(self, *args):
+            result = await self.conn.fetchval(*args)
+            assert 0 < len(result) <= budget
+            slices.append(len(result))
+            return result
+
+    monkeypatch.setattr(
+        writer, "_byte_limited_export_rows", lambda conn, id: original(ProbedConnection(conn), id)
+    )
+    settings = app.state.store.settings
+    path = f"/v1/uploads/{upload_id}/rows/stream"
+    expected = b"".join(line(number, payload) for number, payload in rows)
+    for count, hard_limit in ((8, False), (32, False), (8, True)):
+        settings.export_prefetch_rows = count
+        settings.export_prefetch_hard_limit = hard_limit
+        response = await client.get(path, headers=AUTH)
+        assert response.status_code == 200
+        assert response.headers["X-Row-Count"] == str(len(rows))
+        assert response.content == expected
+    assert [numbers for numbers, _ in batches] == [
+        [1],
+        list(range(2, 34)),
+        list(range(34, 66)),
+        [66, 67],
+        [68],
+        [69],
+        [70],
+        [72],
+        [],
+    ]
+    assert batches[5:7] == [([69], budget), ([70], budget)]
+    assert slices == [len(oversized_line) - budget]
 
 
 async def test_result_reads_hide_in_progress_and_rolled_back_upload(read_api):

@@ -247,3 +247,25 @@ PYTHONPATH=../async-postgres-client/src ../async-postgres-client/.venv/bin/pytho
 
 Порядок двух повторов для каждого режима и 2/4 читателей есть в
 `execution_order`. CPU и память снимайте тем же способом, что выше.
+
+## Смешанные JSONB с лимитом 2 МиБ на выборку
+
+[Результаты](results/2026-11-15-compose-pg17-ndjson-prefetch-hard-limit.json).
+Повторите процедуру со смешанными наборами `alternating` и `bursts` с теми
+же параметрами Compose. Для всех запусков выключите адаптивную оценку по
+прошлой порции и используйте один образ API. Размер HTTP-порции — 128 КиБ.
+
+```bash
+mode=hard   # 8, 32 или hard
+export WRITER_EXPORT_PREFETCH_ADAPTIVE=false
+if [[ "$mode" == hard ]]; then
+  export WRITER_EXPORT_PREFETCH_HARD_LIMIT=true WRITER_EXPORT_PREFETCH_ROWS=8
+else
+  export WRITER_EXPORT_PREFETCH_HARD_LIMIT=false WRITER_EXPORT_PREFETCH_ROWS="$mode"
+fi
+```
+
+Пересоздайте оба контейнера с тем же томом и замерьте скриптом `read_load.py`
+как выше, сохраняя `mode` в имени прогона. Сделайте по два замера на режим
+и 2/4 читателей в порядке `execution_order`. Сверку суммы байтов, полученных
+от PostgreSQL за каждую выборку, делайте отдельно от замеров CPU и скорости.
