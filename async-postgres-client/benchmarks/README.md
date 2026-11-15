@@ -212,3 +212,38 @@ fi
 `execution_order`. CPU и пики памяти снимайте тем же способом, что и для
 широких строк. Один процесс SDK разбирает NDJSON и считает SHA-256; тело
 ответа на диск не сохраняется.
+
+## Смешанные узкие и широкие строки JSONB
+
+[Результаты](results/2026-11-15-compose-pg17-ndjson-prefetch-mixed.json).
+Используйте тот же стенд, настройки Compose и три режима выборки, что выше.
+В отдельной пустой базе после `init-db` вместо прежнего заполнения запустите
+`seed_mixed.py` из каталога сервера. Он сохраняет два набора с одинаковыми
+JSONB-полями в разном порядке и выдаёт отдельный эталон SHA-256 для каждого.
+
+```bash
+out=$(mktemp -d)
+.venv/bin/python ../async-postgres-client/benchmarks/seed_mixed.py > "$out/seed.json"
+```
+
+Нужен `WRITER_TEST_DATABASE_URL`, как в предыдущих замерах. После
+`CHECKPOINT` прогрейте оба набора одной выгрузкой. Перед каждым прогоном
+пересоздайте контейнеры с тем же томом и дождитесь готовности. Используйте
+параметры из нужного набора, `alternating` или `bursts`:
+
+```bash
+profile=alternating
+readers=4
+label="w$profile-n$readers-p$mode-r1"  # mode: 8, 32 или adaptive
+fixture=$(jq -ce --arg profile "$profile" '.profiles[$profile]' "$out/seed.json")
+PYTHONPATH=../async-postgres-client/src ../async-postgres-client/.venv/bin/python \
+  ../async-postgres-client/benchmarks/read_load.py --url "$url" --label "$label" \
+  --upload-id "$(jq -er '.upload_id' <<< "$fixture")" --concurrency "$readers" \
+  --expected-rows "$(jq -er '.stream.rows' <<< "$fixture")" \
+  --expected-bytes "$(jq -er '.stream.bytes' <<< "$fixture")" \
+  --expected-sha256 "$(jq -er '.stream.sha256' <<< "$fixture")" \
+  --output "$out/$label.json"
+```
+
+Порядок двух повторов для каждого режима и 2/4 читателей есть в
+`execution_order`. CPU и память снимайте тем же способом, что выше.
