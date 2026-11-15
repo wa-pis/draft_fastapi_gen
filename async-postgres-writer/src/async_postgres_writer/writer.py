@@ -28,20 +28,22 @@ _EXPORT_NUMBER_PREFIX = ', "row_number": '
 _EXPORT_WRAPPER_BYTES = len(_EXPORT_DATA_PREFIX + _EXPORT_NUMBER_PREFIX + "}\n")
 _EXPORT_BYTE_BATCH = f"""
     WITH batch AS MATERIALIZED (
-        SELECT row_number, payload, row_bytes,
+        SELECT row_number, data, legacy_payload, row_bytes,
                sum(row_bytes) OVER ordered AS total_bytes,
                row_number() OVER ordered AS position
         FROM (
-            SELECT row_number, payload,
-                   octet_length(payload) + length(row_number::text) + {_EXPORT_WRAPPER_BYTES}
-                       AS row_bytes
+            SELECT row_number, data, legacy_payload,
+                   COALESCE(ndjson_bytes, octet_length(legacy_payload)
+                            + length(row_number::text) + {_EXPORT_WRAPPER_BYTES}) AS row_bytes
             FROM (
-                SELECT row_number, convert_to(data::text, 'UTF8') AS payload
+                SELECT row_number, data, ndjson_bytes,
+                       CASE WHEN ndjson_bytes IS NULL THEN convert_to(data::text, 'UTF8') END
+                           AS legacy_payload
                 FROM stream_writer.rows
                 WHERE upload_id = $1 AND row_number > $2
                 ORDER BY row_number LIMIT $3
-            ) AS payloads
-        ) AS candidates
+            ) AS candidates
+        ) AS sized
         WINDOW ordered AS (ORDER BY row_number ROWS UNBOUNDED PRECEDING)
         ORDER BY row_number
     )
@@ -52,15 +54,24 @@ _EXPORT_BYTE_BATCH = f"""
                     FOR $4)
                 ELSE payload END AS body,
            row_bytes
-    FROM batch
-    ORDER BY row_number
-    LIMIT (
-        -- Stop reading the shared batch at the budget boundary. NULL takes the whole batch.
-        SELECT greatest(position - (total_bytes > $4)::integer, 1)
+    FROM (
+        SELECT row_number, data, legacy_payload, row_bytes
         FROM batch
-        WHERE total_bytes >= $4::integer
-        ORDER BY row_number LIMIT 1
-    )
+        ORDER BY row_number
+        LIMIT (
+            -- Stop reading the shared batch at the budget boundary. NULL takes the whole batch.
+            SELECT greatest(position - (total_bytes > $4)::integer, 1)
+            FROM batch
+            WHERE total_bytes >= $4::integer
+            ORDER BY row_number LIMIT 1
+        )
+    ) AS selected
+    CROSS JOIN LATERAL (
+        -- Stored sizes let us encode only rows that made it into the batch.
+        SELECT COALESCE(selected.legacy_payload, convert_to(selected.data::text, 'UTF8'))
+            AS payload OFFSET 0
+    ) AS encoded
+    ORDER BY row_number
 """
 _EXPORT_LINE_SLICE = f"""
     SELECT substring({_EXPORT_LINE} FROM $3 FOR $4)
@@ -147,6 +158,8 @@ class Store:
                     "FROM stream_writer.uploads LIMIT 0"
                 )
                 await conn.fetchrow(self._rows_check)
+                if self.settings.export_prefetch_hard_limit and self.supports_result_reads:
+                    await conn.fetchrow("SELECT ndjson_bytes FROM stream_writer.rows LIMIT 0")
         except (asyncpg.PostgresError, asyncpg.InterfaceError, OSError, TimeoutError) as exc:
             raise WriterError(503, "database_unavailable", "Database is not ready") from exc
 

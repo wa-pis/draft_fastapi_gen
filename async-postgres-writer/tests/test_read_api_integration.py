@@ -121,6 +121,14 @@ async def test_pages_and_ndjson_export_match_committed_rows_in_order(read_api):
     assert baseline.headers["X-Row-Count"] == str(len(expected))
     assert baseline.content.endswith(b"\n")
     assert [decode_json(line) for line in baseline.content.splitlines()] == expected
+    async with app.state.store.pool.acquire() as conn:
+        stored = await conn.fetch(
+            "SELECT ndjson_bytes FROM stream_writer.rows WHERE upload_id = $1 ORDER BY row_number",
+            upload_id,
+        )
+    assert [row["ndjson_bytes"] for row in stored] == [
+        len(line) for line in baseline.content.splitlines(keepends=True)
+    ]
 
     for prefetch, adaptive, hard_limit in ((32, False, False), (8, True, False), (8, False, True)):
         app.state.store.settings.export_prefetch_rows = prefetch
@@ -167,6 +175,42 @@ async def test_keyset_handles_row_number_gaps_and_an_exact_final_page(read_api):
     assert conflict.status_code == 422
 
 
+async def test_updates_refresh_ndjson_length(read_api):
+    client, app, upload_id, _ = read_api
+    path = f"/v1/uploads/{upload_id}"
+    assert (
+        await client.put(path, headers=NDJSON, content=b'{"value":"initial"}\n')
+    ).status_code == 201
+    async with app.state.store.pool.acquire() as conn:
+        initial = await conn.fetchval(
+            "SELECT ndjson_bytes FROM stream_writer.rows WHERE upload_id = $1", upload_id
+        )
+        renumbered = await conn.fetchval(
+            "UPDATE stream_writer.rows SET row_number = 10 WHERE upload_id = $1 "
+            "RETURNING ndjson_bytes",
+            upload_id,
+        )
+        assert renumbered == initial + 1
+        changed = await conn.fetchval(
+            "UPDATE stream_writer.rows SET data = $2::jsonb WHERE upload_id = $1 "
+            "RETURNING ndjson_bytes",
+            upload_id,
+            json.dumps({"value": "Привет 🌊\n"}, ensure_ascii=False),
+        )
+        assert changed != renumbered
+        repaired = await conn.fetchval(
+            "UPDATE stream_writer.rows SET ndjson_bytes = 1 WHERE upload_id = $1 RETURNING ndjson_bytes",
+            upload_id,
+        )
+        assert repaired == changed
+
+    app.state.store.settings.export_prefetch_hard_limit = True
+    response = await client.get(f"{path}/rows/stream", headers=AUTH)
+    assert response.status_code == 200
+    assert decode_json(response.content) == {"row_number": 10, "data": {"value": "Привет 🌊\n"}}
+    assert len(response.content) == changed
+
+
 async def test_hard_prefetch_caps_pg_results_and_preserves_oversized_unicode(read_api, monkeypatch):
     client, app, upload_id, _ = read_api
     budget = 2 * 1024**2
@@ -193,6 +237,7 @@ async def test_hard_prefetch_caps_pg_results_and_preserves_oversized_unicode(rea
         (72, "after the gap"),
         (74, "x" * (budget + 1 - len(line(74, "")))),
     ]
+    legacy_rows = {3, 67, 70}
     async with app.state.store.pool.acquire() as conn, conn.transaction():
         await conn.execute(
             "INSERT INTO stream_writer.uploads (upload_id, sha256, row_count, byte_count) "
@@ -200,15 +245,31 @@ async def test_hard_prefetch_caps_pg_results_and_preserves_oversized_unicode(rea
             upload_id,
             len(rows),
         )
-        await conn.copy_records_to_table(
-            "rows",
-            schema_name="stream_writer",
-            columns=("upload_id", "row_number", "data"),
-            records=(
-                (upload_id, number, json.dumps({"payload": payload}, ensure_ascii=False))
-                for number, payload in rows
-            ),
+        for legacy in (False, True):
+            if legacy:
+                # Simulate rows that existed before the trigger was installed.
+                await conn.execute(
+                    "ALTER TABLE stream_writer.rows DISABLE TRIGGER rows_set_ndjson_bytes"
+                )
+            await conn.copy_records_to_table(
+                "rows",
+                schema_name="stream_writer",
+                columns=("upload_id", "row_number", "data"),
+                records=(
+                    (upload_id, number, json.dumps({"payload": payload}, ensure_ascii=False))
+                    for number, payload in rows
+                    if (number in legacy_rows) == legacy
+                ),
+            )
+            if legacy:
+                await conn.execute(
+                    "ALTER TABLE stream_writer.rows ENABLE ALWAYS TRIGGER rows_set_ndjson_bytes"
+                )
+        missing = await conn.fetch(
+            "SELECT row_number FROM stream_writer.rows WHERE upload_id = $1 AND ndjson_bytes IS NULL",
+            upload_id,
         )
+        assert {row["row_number"] for row in missing} == legacy_rows
 
     batches = []
     slices = []

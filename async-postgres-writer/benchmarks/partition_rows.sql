@@ -41,6 +41,12 @@ CREATE TABLE stream_writer.rows_p2 PARTITION OF stream_writer.rows
 CREATE TABLE stream_writer.rows_p3 PARTITION OF stream_writer.rows
     FOR VALUES WITH (MODULUS 4, REMAINDER 3);
 
+-- LIKE does not copy triggers; this parent trigger also covers the new partitions.
+CREATE TRIGGER rows_set_ndjson_bytes
+BEFORE INSERT OR UPDATE OF data, row_number, ndjson_bytes ON stream_writer.rows
+FOR EACH ROW EXECUTE FUNCTION stream_writer.set_ndjson_bytes();
+ALTER TABLE stream_writer.rows ENABLE ALWAYS TRIGGER rows_set_ndjson_bytes;
+
 DROP TABLE stream_writer.rows_unpartitioned_old;
 
 COMMIT;
