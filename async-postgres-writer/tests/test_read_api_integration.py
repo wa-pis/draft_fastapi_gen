@@ -61,6 +61,7 @@ async def test_pages_and_ndjson_export_match_committed_rows_in_order(read_api):
     upload_path = f"/v1/uploads/{upload_id}"
     high_precision = Decimal("123.4567890123456789012345")
     rows = [{"index": index, "text": 'Привет\n"мир"'} for index in range(1, 131)]
+    rows[0]["nested"] = {"longer": [{"短": '\\"\t\u0001'}, None], "z": [False, 9007199254740993]}
     # Export row 32 is last in the first 32-row fetch and spans multiple HTTP chunks.
     rows[30]["text"] += "я" * (64 * 1024)
     numeric_row = b'{"decimal":123.4567890123456789012345,"exponent":1e400}\n'
@@ -113,6 +114,7 @@ async def test_pages_and_ndjson_export_match_committed_rows_in_order(read_api):
 
     app.state.store.settings.export_prefetch_rows = 8
     app.state.store.settings.export_prefetch_adaptive = False
+    app.state.store.settings.export_prefetch_hard_limit = False
     baseline = await client.get(f"{upload_path}/rows/stream", headers=AUTH)
     assert baseline.status_code == 200
     assert baseline.headers["Content-Type"].split(";")[0] == "application/x-ndjson"
@@ -120,9 +122,10 @@ async def test_pages_and_ndjson_export_match_committed_rows_in_order(read_api):
     assert baseline.content.endswith(b"\n")
     assert [decode_json(line) for line in baseline.content.splitlines()] == expected
 
-    for prefetch, adaptive in ((32, False), (8, True)):
+    for prefetch, adaptive, hard_limit in ((32, False, False), (8, True, False), (8, False, True)):
         app.state.store.settings.export_prefetch_rows = prefetch
         app.state.store.settings.export_prefetch_adaptive = adaptive
+        app.state.store.settings.export_prefetch_hard_limit = hard_limit
         tuned = await client.get(f"{upload_path}/rows/stream", headers=AUTH)
         assert tuned.status_code == 200
         assert tuned.headers == baseline.headers
@@ -188,6 +191,7 @@ async def test_hard_prefetch_caps_pg_results_and_preserves_oversized_unicode(rea
         (69, "x" * (budget - len(line(69, "")))),
         (70, oversized),
         (72, "after the gap"),
+        (74, "x" * (budget + 1 - len(line(74, "")))),
     ]
     async with app.state.store.pool.acquire() as conn, conn.transaction():
         await conn.execute(
@@ -208,6 +212,7 @@ async def test_hard_prefetch_caps_pg_results_and_preserves_oversized_unicode(rea
 
     batches = []
     slices = []
+    expected_lines = {number: line(number, payload) for number, payload in rows}
     original = writer._byte_limited_export_rows
 
     class ProbedConnection:
@@ -216,7 +221,16 @@ async def test_hard_prefetch_caps_pg_results_and_preserves_oversized_unicode(rea
 
         async def fetch(self, *args):
             result = await self.conn.fetch(*args)
-            size = sum(len(row["body"]) for row in result)
+            size = 0
+            for row in result:
+                expected = expected_lines[row["row_number"]]
+                assert row["row_bytes"] == len(expected)
+                if len(expected) > budget:
+                    assert row["body"] == expected[:budget]
+                else:
+                    payload = json.dumps(json.loads(expected)["data"], ensure_ascii=False).encode()
+                    assert row["body"] == payload
+                size += min(len(expected), budget)
             assert size <= budget
             batches.append(([row["row_number"] for row in result], size))
             return result
@@ -232,7 +246,7 @@ async def test_hard_prefetch_caps_pg_results_and_preserves_oversized_unicode(rea
     )
     settings = app.state.store.settings
     path = f"/v1/uploads/{upload_id}/rows/stream"
-    expected = b"".join(line(number, payload) for number, payload in rows)
+    expected = b"".join(expected_lines.values())
     for count, hard_limit in ((8, False), (32, False), (8, True)):
         settings.export_prefetch_rows = count
         settings.export_prefetch_hard_limit = hard_limit
@@ -249,10 +263,15 @@ async def test_hard_prefetch_caps_pg_results_and_preserves_oversized_unicode(rea
         [69],
         [70],
         [72],
+        [74],
         [],
     ]
-    assert batches[5:7] == [([69], budget), ([70], budget)]
-    assert slices == [len(oversized_line) - budget]
+    assert [batch for batch in batches if batch[1] == budget] == [
+        ([69], budget),
+        ([70], budget),
+        ([74], budget),
+    ]
+    assert slices == [len(oversized_line) - budget, 1]
 
 
 async def test_result_reads_hide_in_progress_and_rolled_back_upload(read_api):

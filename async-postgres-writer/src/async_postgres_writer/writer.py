@@ -22,26 +22,45 @@ _EXPORT_ROWS_AFTER = (
     "WHERE upload_id = $1 AND row_number > $2 ORDER BY row_number LIMIT $3"
 )
 _EXPORT_LINE = f"convert_to({_EXPORT_RECORD} || chr(10), 'UTF8')"
+# Match PostgreSQL's JSONB envelope, including the newline written by the HTTP stream.
+_EXPORT_DATA_PREFIX = '{"data": '
+_EXPORT_NUMBER_PREFIX = ', "row_number": '
+_EXPORT_WRAPPER_BYTES = len(_EXPORT_DATA_PREFIX + _EXPORT_NUMBER_PREFIX + "}\n")
 _EXPORT_BYTE_BATCH = f"""
-    WITH RECURSIVE batch (row_number, position, body, total_bytes) AS (
-        VALUES ($2::bigint, 0, NULL::bytea, 0::bigint)
-        UNION ALL
-        SELECT r.row_number, b.position + 1, r.body, b.total_bytes + octet_length(r.body)
-        FROM batch AS b
-        CROSS JOIN LATERAL (
-            SELECT row_number, {_EXPORT_LINE} AS body
-            FROM stream_writer.rows
-            WHERE upload_id = $1 AND row_number > b.row_number
-            ORDER BY row_number LIMIT 1
-        ) AS r
-        WHERE b.position < $3 AND b.total_bytes < $4::integer
+    WITH batch AS MATERIALIZED (
+        SELECT row_number, payload, row_bytes,
+               sum(row_bytes) OVER ordered AS total_bytes,
+               row_number() OVER ordered AS position
+        FROM (
+            SELECT row_number, payload,
+                   octet_length(payload) + length(row_number::text) + {_EXPORT_WRAPPER_BYTES}
+                       AS row_bytes
+            FROM (
+                SELECT row_number, convert_to(data::text, 'UTF8') AS payload
+                FROM stream_writer.rows
+                WHERE upload_id = $1 AND row_number > $2
+                ORDER BY row_number LIMIT $3
+            ) AS payloads
+        ) AS candidates
+        WINDOW ordered AS (ORDER BY row_number ROWS UNBOUNDED PRECEDING)
+        ORDER BY row_number
     )
     SELECT row_number,
-           CASE WHEN total_bytes > $4 THEN substring(body FOR $4) ELSE body END AS body,
-           octet_length(body) AS row_bytes
+           CASE WHEN row_bytes > $4 THEN substring(
+                    '{_EXPORT_DATA_PREFIX}'::bytea || substring(payload FOR $4)
+                    || convert_to('{_EXPORT_NUMBER_PREFIX}' || row_number || '}}' || chr(10), 'UTF8')
+                    FOR $4)
+                ELSE payload END AS body,
+           row_bytes
     FROM batch
-    WHERE position > 0 AND (total_bytes <= $4 OR position = 1)
-    ORDER BY position
+    ORDER BY row_number
+    LIMIT (
+        -- Stop reading the shared batch at the budget boundary. NULL takes the whole batch.
+        SELECT greatest(position - (total_bytes > $4)::integer, 1)
+        FROM batch
+        WHERE total_bytes >= $4::integer
+        ORDER BY row_number LIMIT 1
+    )
 """
 _EXPORT_LINE_SLICE = f"""
     SELECT substring({_EXPORT_LINE} FROM $3 FOR $4)
@@ -91,7 +110,7 @@ async def _byte_limited_export_rows(
     budget = _EXPORT_FETCH_TARGET_BYTES
     while batch := await conn.fetch(_EXPORT_BYTE_BATCH, upload_id, last_row, max_rows, budget):
         for last_row, body, row_bytes in batch:
-            if len(body) < row_bytes:
+            if row_bytes > budget:
                 # shortcut: assemble a single oversized row until the HTTP iterator accepts fragments.
                 full_row = bytearray(body)
                 while len(full_row) < row_bytes:
@@ -101,9 +120,13 @@ async def _byte_limited_export_rows(
                     if not fragment:
                         raise RuntimeError("Incomplete export row")
                     full_row.extend(fragment)
-                body = full_row
-                del full_row, fragment
-            yield body[:-1].decode("utf-8")
+                del fragment
+                yield full_row[:-1].decode("utf-8")
+                del full_row
+            else:
+                payload = body.decode("utf-8")
+                yield f"{_EXPORT_DATA_PREFIX}{payload}{_EXPORT_NUMBER_PREFIX}{last_row}}}"
+                del payload
         del batch, body
         max_rows = MAX_EXPORT_PREFETCH_ROWS
 
