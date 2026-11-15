@@ -137,3 +137,50 @@ printf 'Отчёты: %s\n' "$out"
 `nonvoluntary_ctxt_switches` из `/proc/<pid>/status` процессов роли приложения.
 Размеры фрагментов в клиентском отчёте описывают чтение HTTP и могут отличаться
 от порций, которые отправляет сервер.
+
+## Выборка курсора на широких строках JSONB
+
+[Результаты](results/2026-11-15-compose-pg17-ndjson-prefetch-wide.json).
+Подготовьте **пустую выделенную базу** по [инструкции для сервера](../../async-postgres-writer/benchmarks/README.md#параллельные-выгрузки-1-2-и-4-читателя),
+но замените команду `read_load.py seed` на следующую. Сохраните
+тот же образ PostgreSQL 17.11, WAL-буфер 64 МиБ, один воркер, пул и лимит роли
+по четыре подключения и порции NDJSON до 128 КиБ.
+
+```bash
+out=$(mktemp -d)
+.venv/bin/python ../async-postgres-client/benchmarks/seed_wide.py > "$out/seed.json"
+```
+
+Скрипт использует `WRITER_TEST_DATABASE_URL` из настроек стенда. Он создаёт
+два набора с псевдослучайным полем Base64 (256 и 768 КиБ), каждый объёмом
+около 1,5 ГиБ, и вычисляет эталонный SHA-256 без запроса к HTTP API.
+Сделайте `CHECKPOINT` и прогрейте оба набора одной выгрузкой. Прогоны с 8 и 32
+строками повторите в обратном порядке для 2 и 4 читателей (порядок указан в
+`execution_order` в результатах). Для каждого прогона пересоздавайте оба
+контейнера, сохраняя том и кэш ОС. Перед запуском API проверьте `pg_isready`,
+перед клиентским замером дождитесь ответа 200 от `/health/ready`.
+
+Для каждой пары числа читателей и размера выборки экспортируйте
+`WRITER_EXPORT_PREFETCH_ROWS=8` или `32` перед запуском API. Из каталога
+сервера, с `url`, полученным после запуска контейнера, выполните:
+
+```bash
+width=768  # или 256
+readers=4  # или 2
+label="w$width-n$readers-p$WRITER_EXPORT_PREFETCH_ROWS-r1"  # затем r2
+fixture=$(jq -ce --arg width "$width" '.profiles[$width]' "$out/seed.json")
+PYTHONPATH=../async-postgres-client/src ../async-postgres-client/.venv/bin/python \
+  ../async-postgres-client/benchmarks/read_load.py --url "$url" --label "$label" \
+  --upload-id "$(jq -er '.upload_id' <<< "$fixture")" --concurrency "$readers" \
+  --expected-rows "$(jq -er '.stream.rows' <<< "$fixture")" \
+  --expected-bytes "$(jq -er '.stream.bytes' <<< "$fixture")" \
+  --expected-sha256 "$(jq -er '.stream.sha256' <<< "$fixture")" \
+  --output "$out/$label.json"
+```
+
+Снимайте CPU через `cpu.stat` до и после запроса. Для памяти API используйте
+`VmHWM` процесса, для PostgreSQL — `memory.peak` всего контейнера, пик
+`VmHWM` отдельного процесса роли приложения и максимальную одновременную
+сумму `RssAnon` этих процессов по снимкам каждые 0,2 с. `memory.peak` включает
+файловый кэш и старт контейнера; сумма `RssAnon` не учитывает общую память и
+может пропустить короткий всплеск между снимками.
