@@ -1,0 +1,42 @@
+services:
+  postgres:
+    image: postgres@sha256:ff87138949ad9a46f32ff23bd6852b52ce024a13dffe9b4087be98292cdd3b4f
+    command:
+      - postgres
+      - -c
+      - wal_buffers=64MB
+      - -c
+      - max_wal_size=4GB
+      - -c
+      - track_io_timing=on
+      - -c
+      - track_wal_io_timing=on
+      - -c
+      - fsync=on
+      - -c
+      - full_page_writes=on
+      - -c
+      - synchronous_commit=on
+    environment:
+      PGDATA: /var/lib/postgresql/data
+    labels: &disposable
+      org.ovation.benchmark.disposable: http-ndjson-size
+
+  init-db:
+    image: ovation-http-ndjson-size-writer:local
+    labels: *disposable
+
+  writer:
+    image: ovation-http-ndjson-size-writer:local
+    labels: *disposable
+    ports: !override
+      - "127.0.0.1::8080"
+    environment:
+      WRITER_DATABASE_URL: postgresql://benchmark_writer:${BENCHMARK_WRITER_PASSWORD:?Set BENCHMARK_WRITER_PASSWORD}@postgres:5432/stream_writer?application_name=stream_writer_benchmark
+      WRITER_POOL_SIZE: '4'
+      WRITER_DB_COMMAND_TIMEOUT_SECONDS: '3600'
+
+volumes:
+  postgres-data:
+    name: ovation-http-ndjson-size_pgdata
+    labels: *disposable
